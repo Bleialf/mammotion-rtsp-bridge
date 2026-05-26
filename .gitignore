@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+!.env.mammotion.example
+
+# Agora SDK runtime artifacts (downloaded on first run, contain device state)
+agora_cache.db
+agora_stream.json
+agoradns.dat
+agorareport.dat
+xdump_config
+
+# Reference downloads (not part of this project)
+Mammotion-HA-main/
+PyMammotion-main/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

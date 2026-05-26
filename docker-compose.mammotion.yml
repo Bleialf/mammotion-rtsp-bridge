@@ -1,0 +1,24 @@
+services:
+  mammotion-bridge:
+    # Prebuilt image from GitHub Container Registry. Multi-arch (amd64+arm64).
+    # See .github/workflows/docker-publish.yml.
+    image: ghcr.io/bleialf/mammotion-rtsp-bridge:latest
+    # To build locally instead (development), comment out `image:` above and
+    # uncomment the `build:` block below:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    container_name: mammotion-bridge
+    restart: unless-stopped
+    env_file:
+      - .env.mammotion
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import os,time; p=\"/tmp/mammotion_heartbeat\"; exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p)<120 else 1)'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+    # The bridge publishes RTSP to go2rtc. Default target is
+    # rtsp://frigate:8554/mammotion_pub. Override via the GO2RTC_PUBLISH_URL
+    # env var in .env.mammotion if your go2rtc is reachable under a different
+    # name. See go2rtc.example.yaml for the consumer-side config.

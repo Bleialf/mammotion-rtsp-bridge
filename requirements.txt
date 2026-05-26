@@ -1,0 +1,3 @@
+pymammotion==0.7.115
+agora-python-server-sdk==2.4.5
+requests==2.32.5
