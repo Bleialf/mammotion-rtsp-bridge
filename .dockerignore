@@ -13,8 +13,6 @@ __pycache__/
 .idea/
 .env
 .env.*
-!.env.example
-!.env.mammotion.example
 *.db
 agora_stream.json
 agoradns.dat

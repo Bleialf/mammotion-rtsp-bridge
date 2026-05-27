@@ -142,6 +142,7 @@ class _ConnectionObserver:
         logging.info("Remote user joined: %s", user_id)
         self.parent.remote_uid = str(user_id)
         self.parent.peer_online = True
+        self.parent.peer_offline_since = 0.0
         ret = self.parent.connection.get_local_user().subscribe_video(
             user_id, self.parent._video_sub_options_cls(encodedFrameOnly=True)
         )
@@ -163,6 +164,8 @@ class _ConnectionObserver:
             reason,
         )
         self.parent.peer_online = False
+        if self.parent.peer_offline_since == 0.0:
+            self.parent.peer_offline_since = time.time()
         self.parent.waiting_for_keyframe = True
         self.parent._schedule_recovery()
 
@@ -173,6 +176,8 @@ class _ConnectionObserver:
             reason,
         )
         self.parent.peer_online = False
+        if self.parent.peer_offline_since == 0.0:
+            self.parent.peer_offline_since = time.time()
         self.parent.waiting_for_keyframe = True
         self.parent._schedule_recovery()
 
@@ -264,6 +269,10 @@ class AgoraToRtsp:
         self.connected_at_ts = 0.0
         self.remote_uid: str | None = None
         self.peer_online = False
+        # Wall-clock time the publisher went offline (0 = currently online).
+        # Drives the "publisher gone too long" watchdog so a dead cloud session
+        # (failed wake-ups) actually forces a cycle restart instead of hanging.
+        self.peer_offline_since = 0.0
         self.waiting_for_keyframe = True
         self._last_keyframe_request_ts = 0.0
         self._last_heartbeat_write_ts = 0.0
@@ -386,15 +395,20 @@ class AgoraToRtsp:
             return self._ffmpeg is not None
 
     def _start_ffmpeg_locked(self) -> None:
+        # Transcode HEVC -> constant 10fps H.264. Smoother playback than
+        # passing Mammotion's bursty variable-rate stream through with copy.
+        # This is the exact config that produced a healthy H.264 stream
+        # earlier; the long-term wedging we saw was a dead cloud session +
+        # watchdog bug (fixed in main()), not this transcode. No -err_detect
+        # / -ec flags here — those broke ffmpeg startup. Frigate consumers
+        # must use an h264 hwaccel preset (preset-intel-qsv-h264 on Intel).
         cmd = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
             "warning",
             "-fflags",
-            "+genpts+nobuffer",
-            "-flags",
-            "low_delay",
+            "+genpts+discardcorrupt",
             "-use_wallclock_as_timestamps",
             "1",
             "-f",
@@ -403,7 +417,21 @@ class AgoraToRtsp:
             "pipe:0",
             "-an",
             "-c:v",
-            "copy",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p",
+            "-r",
+            "10",
+            "-vsync",
+            "cfr",
+            "-g",
+            "20",
+            "-bf",
+            "0",
             "-f",
             "rtsp",
             "-rtsp_transport",
@@ -603,8 +631,6 @@ async def main() -> None:
     logging.info("Loading Mammotion SDK modules")
     from pymammotion.client import MammotionClient
 
-    mammotion = MammotionClient(ha_version="3.4.23")
-
     stop_async = asyncio.Event()
 
     loop = asyncio.get_running_loop()
@@ -614,122 +640,168 @@ async def main() -> None:
         except NotImplementedError:
             signal.signal(sig, lambda *_: stop_async.set())
 
-    async def _login_with_retry() -> None:
+    async def _fresh_client() -> "Any | None":
+        # A *new* client + full username/password login every cycle. The
+        # pymammotion refresh token goes stale after a few hours
+        # ("refreshToken invalid!!"); reusing the same client then leaves us
+        # with a dead cloud session that can't send wake-up commands. Starting
+        # fresh sidesteps the dead refresh token entirely.
         while not stop_async.is_set():
+            client = MammotionClient(ha_version="3.4.23")
             try:
                 logging.info("Logging in to Mammotion cloud")
-                await mammotion.login_and_initiate_cloud(
+                await client.login_and_initiate_cloud(
                     settings.mammotion_email, settings.mammotion_password
                 )
-                return
+                return client
             except Exception:
                 logging.exception(
                     "Mammotion login failed; retrying in %ss",
                     settings.reconnect_backoff_seconds,
                 )
+                try:
+                    await client.stop()
+                except Exception:
+                    pass
                 await asyncio.sleep(settings.reconnect_backoff_seconds)
+        return None
 
-    try:
-        await _login_with_retry()
-
-        while not stop_async.is_set():
-            bridge: AgoraToRtsp | None = None
-            try:
-                fields = await fetch_stream_fields(mammotion, settings.mammotion_device_name)
-                if settings.dump_stream_json:
-                    with open("agora_stream.json", "w", encoding="utf-8") as f:
-                        json.dump(fields, f, indent=2, ensure_ascii=False)
-                    logging.info("Saved stream subscription to agora_stream.json")
-
-                for key in ("appid", "channelName", "token", "uid"):
-                    if not fields.get(key):
-                        raise RuntimeError(f"Missing {key} in stream subscription payload")
-
-                bridge = AgoraToRtsp(
-                    rtsp_url=settings.rtsp_publish_url,
-                    area_code=resolve_area_code(fields.get("areaCode")),
-                    heartbeat_file=settings.heartbeat_file,
-                )
-                bridge.configure_recovery(
-                    mammotion=mammotion,
-                    device_name=fields["device_name"],
-                    iot_id=fields["iot_id"],
-                    loop=loop,
-                )
-                bridge.start(
-                    appid=str(fields["appid"]),
-                    channel=str(fields["channelName"]),
-                    token=str(fields["token"]),
-                    uid=str(fields["uid"]),
-                )
-
-                if not bridge.connected_event.wait(timeout=25):
-                    raise RuntimeError("Timed out waiting for Agora connection")
-
-                logging.info("Bridge active. Publishing to %s", settings.rtsp_publish_url)
-
-                next_refresh = (
-                    time.time() + settings.refresh_seconds
-                    if settings.refresh_seconds > 0
-                    else None
-                )
-                while not stop_async.is_set() and not bridge.stop_event.is_set():
-                    await asyncio.sleep(1.0)
-                    now = time.time()
-
-                    if next_refresh is not None and now >= next_refresh:
-                        refreshed = await mammotion.refresh_stream_subscription(
-                            settings.mammotion_device_name, fields["iot_id"]
-                        )
-                        data = getattr(refreshed, "data", None)
-                        if not data or not getattr(data, "token", None):
-                            raise RuntimeError("Token refresh response missing token")
-                        bridge.renew_token(str(getattr(data, "token")))
-                        next_refresh = now + settings.refresh_seconds
-
-                    if (
-                        bridge.connected_at_ts > 0
-                        and bridge.first_frame_ts == 0
-                        and now - bridge.connected_at_ts
-                        > settings.startup_frame_timeout_seconds
-                    ):
-                        raise RuntimeError("No first frame received after startup timeout")
-
-                    if bridge.last_frame_ts > 0 and bridge.peer_online:
-                        # While peer_online is False the bridge is mid-recovery
-                        # (publisher dropped, wake-up scheduled) — silence the
-                        # stall watchdog instead of restarting the whole cycle.
-                        stall_age = now - bridge.last_frame_ts
-                        if (
-                            stall_age > settings.soft_stall_timeout_seconds
-                            and now - bridge._last_keyframe_request_ts
-                            >= settings.keyframe_request_cooldown_seconds
-                        ):
-                            bridge.request_keyframe(reason=f"stall_{int(stall_age)}s")
-                        if stall_age > settings.frame_stall_timeout_seconds:
-                            raise RuntimeError("Frame stream stalled")
-            except Exception:
-                if stop_async.is_set():
-                    break
-                logging.exception(
-                    "Bridge cycle failed; reconnecting in %ss",
-                    settings.reconnect_backoff_seconds,
-                )
-                await _login_with_retry()
-                await asyncio.sleep(settings.reconnect_backoff_seconds)
-            finally:
-                if bridge is not None:
-                    logging.info(
-                        "Cycle stopping. Frames seen=%s dropped=%s",
-                        bridge.frames_seen,
-                        bridge.frames_dropped,
-                    )
-                    bridge.stop()
-    finally:
+    while not stop_async.is_set():
+        bridge: AgoraToRtsp | None = None
+        mammotion: Any = None
         try:
-            await mammotion.stop()
+            mammotion = await _fresh_client()
+            if mammotion is None:
+                break  # stop requested during login
+
+            fields = await fetch_stream_fields(mammotion, settings.mammotion_device_name)
+            if settings.dump_stream_json:
+                with open("agora_stream.json", "w", encoding="utf-8") as f:
+                    json.dump(fields, f, indent=2, ensure_ascii=False)
+                logging.info("Saved stream subscription to agora_stream.json")
+
+            for key in ("appid", "channelName", "token", "uid"):
+                if not fields.get(key):
+                    raise RuntimeError(f"Missing {key} in stream subscription payload")
+
+            bridge = AgoraToRtsp(
+                rtsp_url=settings.rtsp_publish_url,
+                area_code=resolve_area_code(fields.get("areaCode")),
+                heartbeat_file=settings.heartbeat_file,
+            )
+            bridge.configure_recovery(
+                mammotion=mammotion,
+                device_name=fields["device_name"],
+                iot_id=fields["iot_id"],
+                loop=loop,
+            )
+            bridge.start(
+                appid=str(fields["appid"]),
+                channel=str(fields["channelName"]),
+                token=str(fields["token"]),
+                uid=str(fields["uid"]),
+            )
+
+            if not bridge.connected_event.wait(timeout=25):
+                raise RuntimeError("Timed out waiting for Agora connection")
+
+            logging.info("Bridge active. Publishing to %s", settings.rtsp_publish_url)
+
+            next_refresh = (
+                time.time() + settings.refresh_seconds
+                if settings.refresh_seconds > 0
+                else None
+            )
+            # Proactive keep-alive. The Mammotion app sends
+            # send_todev_ble_sync(sync_type=2) every ~20s to tell the device a
+            # viewer is present; without it the device leaves the Agora channel
+            # after ~50s. Sending it ourselves should keep the publisher online
+            # continuously instead of relying on reactive recovery after it drops.
+            keepalive_interval = 20.0
+            next_keepalive = time.time() + keepalive_interval
+            while not stop_async.is_set() and not bridge.stop_event.is_set():
+                await asyncio.sleep(1.0)
+                now = time.time()
+
+                if now >= next_keepalive:
+                    try:
+                        await mammotion.send_command_with_args(
+                            fields["device_name"], "send_todev_ble_sync", sync_type=2
+                        )
+                    except Exception:
+                        logging.debug("Keep-alive sync failed", exc_info=True)
+                    next_keepalive = now + keepalive_interval
+
+                if next_refresh is not None and now >= next_refresh:
+                    refreshed = await mammotion.refresh_stream_subscription(
+                        settings.mammotion_device_name, fields["iot_id"]
+                    )
+                    data = getattr(refreshed, "data", None)
+                    if not data or not getattr(data, "token", None):
+                        raise RuntimeError("Token refresh response missing token")
+                    bridge.renew_token(str(getattr(data, "token")))
+                    next_refresh = now + settings.refresh_seconds
+
+                if (
+                    bridge.connected_at_ts > 0
+                    and bridge.first_frame_ts == 0
+                    and now - bridge.connected_at_ts
+                    > settings.startup_frame_timeout_seconds
+                ):
+                    raise RuntimeError("No first frame received after startup timeout")
+
+                if bridge.last_frame_ts > 0 and bridge.peer_online:
+                    # While peer_online is False the bridge is mid-recovery
+                    # (publisher dropped, wake-up scheduled) — silence the
+                    # stall watchdog instead of restarting the whole cycle.
+                    stall_age = now - bridge.last_frame_ts
+                    if (
+                        stall_age > settings.soft_stall_timeout_seconds
+                        and now - bridge._last_keyframe_request_ts
+                        >= settings.keyframe_request_cooldown_seconds
+                    ):
+                        bridge.request_keyframe(reason=f"stall_{int(stall_age)}s")
+                    if stall_age > settings.frame_stall_timeout_seconds:
+                        raise RuntimeError("Frame stream stalled")
+
+                # Publisher-gone-too-long watchdog. Fires even while
+                # peer_online is False, so a dead cloud session (recovery
+                # wake-ups failing) forces a full cycle restart — which
+                # re-logins with a fresh MammotionClient next iteration.
+                if (
+                    not bridge.peer_online
+                    and bridge.peer_offline_since > 0
+                    and now - bridge.peer_offline_since
+                    > settings.frame_stall_timeout_seconds
+                ):
+                    raise RuntimeError(
+                        "Publisher gone too long (likely dead cloud session); "
+                        "restarting cycle"
+                    )
         except Exception:
-            logging.exception("Mammotion stop failed")
+            if stop_async.is_set():
+                break
+            logging.exception(
+                "Bridge cycle failed; reconnecting in %ss",
+                settings.reconnect_backoff_seconds,
+            )
+            await asyncio.sleep(settings.reconnect_backoff_seconds)
+        finally:
+            if bridge is not None:
+                logging.info(
+                    "Cycle stopping. Frames seen=%s dropped=%s",
+                    bridge.frames_seen,
+                    bridge.frames_dropped,
+                )
+                bridge.stop()
+            # Tear down the per-cycle cloud client so the next cycle logs in
+            # fresh (new tokens) rather than inheriting a dead session.
+            if mammotion is not None:
+                try:
+                    await mammotion.stop()
+                except Exception:
+                    logging.exception("Mammotion stop failed")
+                mammotion = None
 
 
 if __name__ == "__main__":

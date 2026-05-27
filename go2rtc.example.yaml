@@ -1,15 +1,12 @@
-# go2rtc configuration for receiving the Mammotion bridge stream.
+# go2rtc stream definition for the Mammotion bridge.
 #
-# The bridge runs an internal ffmpeg that pushes RTSP to go2rtc. go2rtc just
-# accepts the publish and serves it under whatever protocols its clients want.
+# Frigate users: this is already covered by frigate.example.yaml (Frigate runs
+# its own go2rtc). Use this file only if you run a STANDALONE go2rtc — in that
+# case drop the outer `go2rtc:` key and keep just the `streams:` block.
 #
-# The empty `mammotion:` entry declares a named stream with no source — go2rtc
-# accepts publishes to that name and serves whatever was published to whoever
-# asks for it. Same name on both ends, no alias.
-#
-# For Frigate users: drop this block under the top-level `go2rtc:` key in
-# Frigate's config. For standalone go2rtc, use just the `streams:` block at
-# the top level (without the outer `go2rtc:` wrapper).
+# The empty `mammotion:` value declares a stream with no source: go2rtc accepts
+# an RTSP publish on that name (from the bridge) and serves it to any consumer
+# over RTSP / WebRTC / HLS / MSE. The name must match GO2RTC_PUBLISH_URL.
 
 go2rtc:
   streams:

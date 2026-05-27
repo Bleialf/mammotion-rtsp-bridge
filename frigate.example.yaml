@@ -1,0 +1,23 @@
+# Frigate config for the Mammotion bridge.
+# Merge the `go2rtc:` and `cameras:` blocks into your Frigate config.yml.
+
+go2rtc:
+  streams:
+    # Empty value = "accept an RTSP publish on this name and serve it".
+    # The bridge pushes here (GO2RTC_PUBLISH_URL). Name must match.
+    mammotion:
+
+cameras:
+  mammotion:
+    ffmpeg:
+      # The bridge transcodes to H.264 — use an h264 hwaccel preset.
+      # Intel iGPU: preset-intel-qsv-h264 | NVIDIA: preset-nvidia | none: omit.
+      hwaccel_args: preset-intel-qsv-h264
+      inputs:
+        - path: rtsp://127.0.0.1:8554/mammotion
+          input_args: preset-rtsp-restream
+          roles: [record]
+    detect:
+      enabled: false
+    record:
+      enabled: true

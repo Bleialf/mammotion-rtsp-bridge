@@ -12,8 +12,6 @@ venv/
 # Secrets and local config
 .env
 .env.*
-!.env.example
-!.env.mammotion.example
 
 # Agora SDK runtime artifacts (downloaded on first run, contain device state)
 agora_cache.db

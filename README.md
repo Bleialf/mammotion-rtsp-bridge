@@ -1,107 +1,164 @@
-# Mammotion -> go2rtc Bridge (Docker)
+# Mammotion → go2rtc/Frigate Bridge
 
-This container logs in to Mammotion, subscribes to the Agora video track, and
-publishes it as RTSP to go2rtc. ffmpeg runs inside the bridge container, fed
-raw HEVC NAL units from the Agora SDK on its stdin, with wall-clock timestamps
-applied before the RTSP push — which is the fix for the historic
-"Timestamps are unset / Broken pipe" loop.
+Streams a Mammotion robot mower's camera (Yuka, Luba 2, etc.) into
+[go2rtc](https://github.com/AlexxIT/go2rtc) / [Frigate](https://frigate.video/)
+so you can view and record it like any other camera.
 
-## Add To Existing Frigate Compose
+Mammotion only exposes the live view through Agora (a WebRTC SDK) inside their
+app. This bridge logs into your Mammotion account, subscribes to that Agora
+video as an audience client, transcodes it to a steady 10 fps H.264 stream, and
+publishes it to go2rtc over RTSP.
 
-1. Copy this folder to your Frigate host, for example as `./mammotion-bridge` next to your main compose file.
-2. Copy `.env.mammotion.example` to `.env.mammotion` and fill credentials.
-3. Add this service to your existing compose:
+```
+Mammotion cloud ── Agora (HEVC) ──▶ bridge (ffmpeg → H.264) ──RTSP──▶ go2rtc ──▶ Frigate / WebRTC / HLS
+```
+
+## Requirements
+
+- Docker + Docker Compose
+- A running go2rtc, standalone or bundled inside Frigate (Frigate exposes it on port 8554/1984)
+- Your Mammotion app email + password
+
+## Quick start
+
+1. **Add the bridge service** to your Compose file with your Mammotion
+   credentials inline (see the full example below), or use the standalone
+   [docker-compose.mammotion.yml](docker-compose.mammotion.yml).
+
+2. **Add the go2rtc + camera config.** Merge [frigate.example.yaml](frigate.example.yaml)
+   into your Frigate `config.yml` (or, for standalone go2rtc, use
+   [go2rtc.example.yaml](go2rtc.example.yaml)).
+
+3. **Start it.**
+   ```bash
+   docker compose up -d
+   docker compose restart frigate   # so Frigate picks up the new camera
+   ```
+
+The prebuilt image (`ghcr.io/bleialf/mammotion-rtsp-bridge:latest`, amd64 +
+arm64) is pulled automatically — no build step needed.
+
+### Example: bridge alongside Frigate
+
+The bridge just needs to reach Frigate's go2rtc, so the simplest setup is to
+drop it into the same Compose file as Frigate (they share a network, so the
+`frigate` hostname resolves):
 
 ```yaml
+services:
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:stable
+    container_name: frigate
+    restart: unless-stopped
+    privileged: true
+    shm_size: "1gb"
+    devices:
+      - /dev/dri:/dev/dri          # Intel hwaccel
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - frigate-config:/config
+      - /mnt/nvme/frigate:/media/frigate     # adjust to your storage
+    environment:
+      FRIGATE_RTSP_PASSWORD: "CHANGE_ME"
+      LIBVA_DRIVER_NAME: iHD
+    ports:
+      - "8971:8971"
+      - "8554:8554"               # go2rtc RTSP (the bridge publishes here)
+      - "1984:1984"               # go2rtc web UI
+
   mammotion-bridge:
-    build:
-      context: ./mammotion-bridge
-      dockerfile: Dockerfile
+    image: ghcr.io/bleialf/mammotion-rtsp-bridge:latest
     container_name: mammotion-bridge
     restart: unless-stopped
-    env_file:
-      - ./mammotion-bridge/.env.mammotion
-    healthcheck:
-      test: ["CMD-SHELL", "python -c 'import os,time; p=\"/tmp/mammotion_heartbeat\"; exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p)<120 else 1)'"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 45s
+    environment:
+      MAMMOTION_EMAIL: "your@email.com"
+      MAMMOTION_PASSWORD: "your-password"
+      MAMMOTION_DEVICE_NAME: "first"
+      # Defaults to rtsp://frigate:8554/mammotion — only set if different.
+      #GO2RTC_PUBLISH_URL: "rtsp://frigate:8554/mammotion"
+
+volumes:
+  frigate-config:
 ```
 
-4. Deploy:
+## Configuration
 
-```bash
-docker compose up -d --build mammotion-bridge
-```
+All settings are environment variables on the bridge service. Only the first
+three are required; the rest have sensible defaults.
 
-## go2rtc Configuration
-
-Add this to your Frigate config (or your standalone `go2rtc.yaml` without the
-outer `go2rtc:` key):
-
-```yaml
-go2rtc:
-  streams:
-    mammotion:
-```
-
-The empty entry declares a named stream with no source — go2rtc accepts
-RTSP publishes to that name (the bridge sends them) and serves whatever
-was published to whoever asks for it.
-
-## Frigate Input
-
-```yaml
-ffmpeg:
-  inputs:
-    - path: rtsp://127.0.0.1:8554/mammotion
-      roles: [detect, record]
-```
-
-## Environment Variables
-
-| Variable | Default | Notes |
+| Variable | Default | Purpose |
 | --- | --- | --- |
-| `MAMMOTION_EMAIL` | _required_ | Mammotion account |
-| `MAMMOTION_PASSWORD` | _required_ | Mammotion account |
-| `MAMMOTION_DEVICE_NAME` | first device | Name shown in the Mammotion app |
-| `GO2RTC_PUBLISH_URL` | `rtsp://frigate:8554/mammotion` | RTSP URL ffmpeg pushes to |
+| `MAMMOTION_EMAIL` | — | Mammotion account email |
+| `MAMMOTION_PASSWORD` | — | Mammotion account password |
+| `MAMMOTION_DEVICE_NAME` | `first` | Device name in the app, or `first` to auto-pick |
+| `GO2RTC_PUBLISH_URL` | `rtsp://frigate:8554/mammotion` | Where the bridge publishes; stream name must match go2rtc |
+| `MAMMOTION_HEARTBEAT_FILE` | unset | File touched per frame for the Docker healthcheck |
 | `MAMMOTION_REFRESH_SECONDS` | `1800` | Agora token refresh interval (0 = off) |
-| `MAMMOTION_HEARTBEAT_FILE` | _unset_ | Path touched on each frame from Agora |
+| `MAMMOTION_RECONNECT_BACKOFF_SECONDS` | `8` | Delay before retrying after a failure |
+| `MAMMOTION_STARTUP_FRAME_TIMEOUT_SECONDS` | `90` | Restart if no first frame after connect |
+| `MAMMOTION_SOFT_STALL_TIMEOUT_SECONDS` | `12` | Request a keyframe after this much stall |
+| `MAMMOTION_KEYFRAME_REQUEST_COOLDOWN_SECONDS` | `8` | Min seconds between keyframe requests |
+| `MAMMOTION_FRAME_STALL_TIMEOUT_SECONDS` | `120` | Hard-restart cycle if frames/publisher stay gone this long |
 
-## Publishing Prebuilt Images
+### go2rtc / Frigate
 
-This repo includes a GitHub Actions workflow ([.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)) that builds a multi-arch image (amd64 + arm64) and pushes it to GitHub Container Registry on every push to `main`. Tags produced:
+See [frigate.example.yaml](frigate.example.yaml) (Frigate) or
+[go2rtc.example.yaml](go2rtc.example.yaml) (standalone go2rtc). The key points:
 
-- `ghcr.io/bleialf/mammotion-rtsp-bridge:latest` — current main
-- `ghcr.io/bleialf/mammotion-rtsp-bridge:sha-<short>` — pinned to a commit
-- `ghcr.io/bleialf/mammotion-rtsp-bridge:v1.2.3` — when you tag a release
+- go2rtc needs an **empty stream** named to match `GO2RTC_PUBLISH_URL` (e.g.
+  `mammotion:`) — that makes it accept the bridge's RTSP publish.
+- The bridge outputs **H.264**, so Frigate's `hwaccel_args` must be an h264
+  preset (`preset-intel-qsv-h264` on Intel).
+- `roles: [record]` keeps it simple: continuous recording, no detect process.
 
-First-time setup on GitHub:
-1. Push this repo to `Bleialf/mammotion-rtsp-bridge`.
-2. The workflow runs automatically; first build takes a few minutes (subsequent ones use the GHA cache and are fast).
-3. After the first successful run, find the image under your repo's "Packages" sidebar. It's private by default — leave it private.
+### Home Assistant dashboard (optional)
 
-Pulling on the NUC (private image, one-time):
-```bash
-# Create a Personal Access Token (classic) with `read:packages` at
-# https://github.com/settings/tokens, then:
-echo $GHCR_PAT | docker login ghcr.io -u Bleialf --password-stdin
+If you use [advanced-camera-card](https://card.camera/) with go2rtc WebRTC,
+point it at the stream name explicitly (the camera entity name usually won't
+match the go2rtc stream name):
+
+```yaml
+- camera_entity: camera.mammotion
+  live_provider: go2rtc
+  go2rtc:
+    url: http://<go2rtc-host>:1984
+    stream: mammotion
+    modes: [webrtc]
 ```
 
-Deploying / upgrading:
+## How robust it is
+
+The mower drops out of the Agora channel periodically and its cloud session
+token expires after a few hours. The bridge tries to handle both automatically:
+
+- **Proactive keep-alive** every 20 s to keep the mower publishing.
+- **Recovery** if the mower leaves anyway (wakes it back up, ~2 s gap).
+- **Fresh login per cycle** so an expired cloud token never wedges it.
+- **Watchdogs** that restart the cycle if frames stall, the publisher stays
+  gone, or the ffmpeg subprocess dies.
+
+## Troubleshooting
+
+- **Stream works in go2rtc UI but not in Frigate** → codec preset mismatch.
+  The bridge sends H.264; use `preset-intel-qsv-h264` (not h265).
+- **Frigate logs `404 Not Found` for the stream** → the bridge isn't publishing.
+  Check `docker logs mammotion-bridge`; confirm `Bridge active. Publishing to …`.
+- **Frigate `detect` ffmpeg crash-loops on HEVC errors** → you're on an old
+  config; the current bridge outputs H.264. Re-pull the image and use the h264 preset.
+- **Choppy / never loads in a HA card** → set the explicit `stream:` name in the
+  card (see above); the auto entity→stream mapping often picks the wrong name.
+- **Check the live stream directly:** `http://<go2rtc-host>:1984/stream.html?src=mammotion`
+
+## Building from source
+
+The image is built and published by GitHub Actions
+([.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml))
+on every push to `main`. To build locally:
+
 ```bash
-docker compose pull mammotion-bridge && docker compose up -d mammotion-bridge
+docker buildx build --platform linux/amd64,linux/arm64 \
+  --tag ghcr.io/<you>/mammotion-rtsp-bridge:latest --push .
 ```
 
-No more local `--build` step.
-
-## Robustness Features
-
-- automatic Mammotion login retries
-- automatic ffmpeg restart on broken pipe (resumes from next keyframe)
-- startup watchdog (restarts bridge if no first frame arrives)
-- frame stall watchdog (requests a keyframe, then restarts if frames stop)
-- periodic Agora token renewal
-- Docker healthcheck based on a frame-ingress heartbeat file
+Uses [pymammotion](https://github.com/mikey0000/PyMammotion) for the Mammotion
+cloud/Agora integration.

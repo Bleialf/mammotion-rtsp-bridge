@@ -1,24 +1,46 @@
 services:
   mammotion-bridge:
-    # Prebuilt image from GitHub Container Registry. Multi-arch (amd64+arm64).
-    # See .github/workflows/docker-publish.yml.
+    # Prebuilt multi-arch image (amd64 + arm64) from GitHub Container Registry.
     image: ghcr.io/bleialf/mammotion-rtsp-bridge:latest
-    # To build locally instead (development), comment out `image:` above and
-    # uncomment the `build:` block below:
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile
     container_name: mammotion-bridge
     restart: unless-stopped
-    env_file:
-      - .env.mammotion
+    environment:
+      # ── Required ──────────────────────────────────────────────────────────
+      MAMMOTION_EMAIL: "your@email.com"
+      MAMMOTION_PASSWORD: "your-password"
+      # Device name as shown in the Mammotion app, or "first" to auto-pick.
+      MAMMOTION_DEVICE_NAME: "first"
+      # Where the bridge publishes (RTSP publish into go2rtc). Stream name at the
+      # end must match the go2rtc/Frigate config. Use the Frigate service name if
+      # in the same compose stack, else the host/IP go2rtc is reachable at.
+      GO2RTC_PUBLISH_URL: "rtsp://frigate:8554/mammotion"
+      # File touched per frame, for the healthcheck below.
+      MAMMOTION_HEARTBEAT_FILE: "/tmp/mammotion_heartbeat"
+
+      # ── Optional tuning (defaults shown; uncomment to change) ─────────────
+      #MAMMOTION_REFRESH_SECONDS: "1800"                    # Agora token refresh (0=off)
+      #MAMMOTION_RECONNECT_BACKOFF_SECONDS: "8"             # retry delay after failure
+      #MAMMOTION_STARTUP_FRAME_TIMEOUT_SECONDS: "90"        # restart if no first frame
+      #MAMMOTION_SOFT_STALL_TIMEOUT_SECONDS: "12"           # request keyframe after stall
+      #MAMMOTION_KEYFRAME_REQUEST_COOLDOWN_SECONDS: "8"     # min gap between keyframe reqs
+      #MAMMOTION_FRAME_STALL_TIMEOUT_SECONDS: "120"         # hard-restart cycle if stalled
     healthcheck:
       test: ["CMD-SHELL", "python -c 'import os,time; p=\"/tmp/mammotion_heartbeat\"; exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p)<120 else 1)'"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 45s
-    # The bridge publishes RTSP to go2rtc. Default target is
-    # rtsp://frigate:8554/mammotion_pub. Override via the GO2RTC_PUBLISH_URL
-    # env var in .env.mammotion if your go2rtc is reachable under a different
-    # name. See go2rtc.example.yaml for the consumer-side config.
+
+    # EASIEST: paste this service into your existing Frigate compose file so they
+    # share a network and the "frigate" hostname resolves automatically.
+    #
+    # If you keep it as a SEPARATE compose project, attach it to Frigate's network
+    # by uncommenting below (replace "frigate_default" with Frigate's actual
+    # network — find it with `docker network ls`):
+    #
+    # networks:
+    #   - frigate_net
+# networks:
+#   frigate_net:
+#     external: true
+#     name: frigate_default
