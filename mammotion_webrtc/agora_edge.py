@@ -754,6 +754,16 @@ class AgoraWebSocketHandler:
                         continue
 
                     message_type = response.get("_type", "")
+                    # TEMP diagnostic: log every message during the join phase so
+                    # we can find where Mammotion's edge delivers the ORTC params
+                    # (PetKit got them in the join-success _message; Mammotion's
+                    # join-success only carries {code,level,role}).
+                    LOGGER.info(
+                        "WS-join <- type=%s result=%s body=%s",
+                        message_type,
+                        response.get("_result"),
+                        json.dumps(response)[:1500],
+                    )
                     if message_type in self._message_handlers:
                         result = await self._message_handlers[message_type](response)
                         if isinstance(result, str) and result:
