@@ -13,11 +13,23 @@ publishes it to go2rtc over RTSP.
 Mammotion cloud ── Agora (HEVC) ──▶ bridge (ffmpeg → H.264) ──RTSP──▶ go2rtc ──▶ Frigate / WebRTC / HLS
 ```
 
+> ⚠️ **Unofficial & unsupported.** This is not endorsed by Mammotion. It logs
+> into their cloud the same way the app does, but using it is at your own risk —
+> your account could be rate-limited, blocked, or broken by an app update at any
+> time. Don't rely on it for anything critical.
+
+> 🔑 **Use a separate (shared) account.** Mammotion accounts are effectively
+> single-session: when the bridge logs in, your phone app gets logged out, and
+> vice-versa. Create a second Mammotion account, **share the mower with it** from
+> your main account (in the app), and give the bridge *that* account's
+> credentials. Your main account/app then keeps working normally alongside the
+> bridge.
+
 ## Requirements
 
 - Docker + Docker Compose
 - A running go2rtc, standalone or bundled inside Frigate (Frigate exposes it on port 8554/1984)
-- Your Mammotion app email + password
+- A **secondary** Mammotion account with the mower shared to it (see the note above)
 
 ## Quick start
 
@@ -147,13 +159,33 @@ token expires after a few hours. The bridge tries to handle both automatically:
   config; the current bridge outputs H.264. Re-pull the image and use the h264 preset.
 - **Choppy / never loads in a HA card** → set the explicit `stream:` name in the
   card (see above); the auto entity→stream mapping often picks the wrong name.
+- **Phone app keeps logging out** (or bridge logs `refreshToken invalid!!`) →
+  you're sharing one account between the app and the bridge. Use a separate
+  shared account for the bridge (see the note at the top).
 - **Check the live stream directly:** `http://<go2rtc-host>:1984/stream.html?src=mammotion`
 
-## Building from source
+## Versions & releases
 
 The image is built and published by GitHub Actions
-([.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml))
-on every push to `main`. To build locally:
+([.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)):
+
+| Image tag | When | Use for |
+| --- | --- | --- |
+| `:latest` | every push to `main` | bleeding edge / auto-update |
+| `:sha-<short>` | every push to `main` | pin an exact commit |
+| `:1.2.3`, `:1.2`, `:1` | pushing a git tag `v1.2.3` | stable releases (pin at any precision) |
+
+Cut a release by tagging:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+For stability, pin the compose image to a major (`:1`) — auto-gets patch/minor
+updates but never a breaking major. For always-newest, use `:latest`.
+
+### Building locally
 
 ```bash
 docker buildx build --platform linux/amd64,linux/arm64 \

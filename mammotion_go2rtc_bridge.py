@@ -73,7 +73,11 @@ def parse_args() -> Settings:
         type=int,
         default=int(os.getenv("MAMMOTION_KEYFRAME_REQUEST_COOLDOWN_SECONDS", "8")),
     )
-    parser.add_argument("--heartbeat-file", default=os.getenv("MAMMOTION_HEARTBEAT_FILE", ""))
+    parser.add_argument(
+        "--heartbeat-file",
+        default=os.getenv("MAMMOTION_HEARTBEAT_FILE", "/tmp/mammotion_heartbeat"),
+        help="Touched on every frame; the Docker healthcheck reads it. Set empty to disable.",
+    )
     parser.add_argument("--dump-stream-json", action="store_true")
     args = parser.parse_args()
 
