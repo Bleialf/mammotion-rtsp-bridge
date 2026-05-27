@@ -79,7 +79,7 @@ services:
       - "1984:1984"               # go2rtc web UI
 
   mammotion-bridge:
-    image: ghcr.io/bleialf/mammotion-rtsp-bridge:latest
+    image: ghcr.io/bleialf/mammotion-rtsp-bridge:stable   # newest release; :latest = bleeding edge
     container_name: mammotion-bridge
     restart: unless-stopped
     environment:
@@ -171,9 +171,13 @@ The image is built and published by GitHub Actions
 
 | Image tag | When | Use for |
 | --- | --- | --- |
-| `:latest` | every push to `main` | bleeding edge / auto-update |
+| `:stable` | a release is tagged | **recommended** — newest tagged release |
+| `:latest` | every push to `main` | bleeding edge / dev |
+| `:1.2.3`, `:1.2`, `:1` | tag `v1.2.3` | pin a release at any precision |
 | `:sha-<short>` | every push to `main` | pin an exact commit |
-| `:1.2.3`, `:1.2`, `:1` | pushing a git tag `v1.2.3` | stable releases (pin at any precision) |
+
+`:stable` only moves when you cut a release; `:latest` moves on every commit to
+main. Most people should run `:stable`.
 
 Cut a release by tagging:
 
@@ -181,9 +185,6 @@ Cut a release by tagging:
 git tag v1.0.0
 git push origin v1.0.0
 ```
-
-For stability, pin the compose image to a major (`:1`) — auto-gets patch/minor
-updates but never a breaking major. For always-newest, use `:latest`.
 
 ### Building locally
 

@@ -1,7 +1,8 @@
 services:
   mammotion-bridge:
     # Prebuilt multi-arch image (amd64 + arm64) from GitHub Container Registry.
-    image: ghcr.io/bleialf/mammotion-rtsp-bridge:latest
+    # :stable = newest tagged release (recommended). Use :latest for bleeding edge.
+    image: ghcr.io/bleialf/mammotion-rtsp-bridge:stable
     container_name: mammotion-bridge
     restart: unless-stopped
     environment:
