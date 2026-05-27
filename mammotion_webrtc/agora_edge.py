@@ -881,15 +881,11 @@ class AgoraWebSocketHandler:
         message = response.get("_message", {})
         ortc = message.get("ortc", {})
         if not ortc:
-            # Mammotion's join response may carry ORTC under a different key or
-            # nesting than PetKit's. Dump the structure so we can adapt.
-            LOGGER.error(
-                "join_v3 success did not include ORTC parameters. "
-                "response keys=%s; _message keys=%s; full _message=%s",
-                list(response.keys()),
-                list(message.keys()) if isinstance(message, dict) else type(message),
-                json.dumps(message)[:2000],
-            )
+            # Mammotion sends two success messages: the join_v3 response (which
+            # DOES carry _message.ortc) and a set_client_role ack ({code,level,
+            # role}). This is the latter — ignore it; the ortc one is handled
+            # separately and sets the pending answer.
+            LOGGER.debug("Success message without ORTC (role ack); ignoring: %s", message)
             return None
 
         await self._send_set_client_role(role="host", level=0)

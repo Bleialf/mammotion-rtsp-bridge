@@ -48,6 +48,11 @@ from mammotion_webrtc.go2rtc_register import Go2RTCStreamRegistrar
 
 LOGGER = logging.getLogger("mammotion_webrtc_bridge")
 
+# Minimum seconds between get_stream_subscription calls. Each call re-triggers
+# the mower to publish but also hits the cloud, so we debounce go2rtc's rapid
+# WHEP retries to avoid an account lockout.
+CREDS_DEBOUNCE_S = 15.0
+
 # Mirrors the AREA_CODE_MAP in the main-branch bridge, but maps to the
 # "CN,GLOBAL"-style strings that Agora's choose_server REST API expects (not the
 # integer bitmask used by the native Agora SDK on main).
@@ -195,19 +200,38 @@ async def main() -> None:
         )
 
     async def credentials_provider() -> StreamCredentials:
-        """Return cached Agora RTC credentials (set at login).
+        """Return Agora RTC credentials, re-triggering the mower to publish.
 
-        Deliberately does NOT re-fetch the stream subscription per WHEP session:
-        get_stream_subscription sends an MQTT command to the device every call,
-        which hammers the cloud and fails outright if the session has expired.
-        We reuse the credentials captured at login; token renewal is handled by
-        the Agora edge's will-expire signal path. If the token has fully expired
-        the next login cycle refreshes the cache.
+        get_stream_subscription does double duty: it returns the RTC token AND
+        sends the MQTT command that tells the mower to (re)join Agora and start
+        publishing video (the publish window is only ~50s). So on a viewer
+        connect we must re-fetch to wake the publisher — but debounced, so
+        go2rtc's rapid WHEP retries don't hammer the cloud (which risks an
+        account lockout). Within the debounce window we return the cached creds.
         """
-        creds = state.get("credentials")
-        if creds is None:
-            raise RuntimeError("Mammotion credentials not ready")
-        return creds
+        mammotion = state["mammotion"]
+        now = loop.time()
+        last = state.get("creds_fetched_at", 0.0)
+        cached = state.get("credentials")
+        if mammotion is None or (cached is not None and now - last < CREDS_DEBOUNCE_S):
+            if cached is None:
+                raise RuntimeError("Mammotion credentials not ready")
+            return cached
+        try:
+            fields = await fetch_stream_fields(mammotion, state["device_name"])
+            for key in ("appid", "channelName", "token", "uid"):
+                if not fields.get(key):
+                    raise RuntimeError(f"Missing {key} in stream subscription payload")
+            state["device_name"] = fields["device_name"]
+            state["iot_id"] = fields["iot_id"]
+            state["credentials"] = _creds_from_fields(fields)
+            state["creds_fetched_at"] = now
+            LOGGER.info("Re-triggered mower publish via get_stream_subscription")
+        except Exception:
+            LOGGER.exception("Credential refresh failed; using cached if available")
+            if cached is None:
+                raise
+        return state["credentials"]
 
     # ---- Start the WHEP aiohttp server (long-lived) ----
     app = create_whep_app(credentials_provider, auth_token=whep_token)
