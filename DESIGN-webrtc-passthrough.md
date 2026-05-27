@@ -54,6 +54,46 @@ Quick test (no porting needed): open `http://<host>:1984/webrtc.html?src=mammoti
 against the current H.265 stream. Plays = green light. Fails (only MSE/HLS
 works) = H.265-over-WebRTC unsupported = abandon this branch.
 
+## Testing this branch
+
+Runs alongside the working RTSP `mammotion` stream under the name
+`mammotion_webrtc`, so you can A/B compare without breaking what works.
+
+1. On the host, check out this branch and build the image (it now contains both
+   bridges; `BRIDGE_SCRIPT` selects which runs):
+   ```bash
+   git fetch && git checkout webrtc-passthrough
+   ```
+2. Fill credentials in `docker-compose.webrtc.yml`, then bring it up next to
+   Frigate (same compose project, or attach to Frigate's network):
+   ```bash
+   docker compose -f docker-compose.webrtc.yml up -d --build
+   ```
+3. Watch the bridge log — you want to see, in order:
+   ```
+   Logging in to Mammotion cloud
+   Stream subscription ready for device ... (channel=...)
+   WHEP server listening on 0.0.0.0:8555; go2rtc source = webrtc:http://mammotion-webrtc:8555/whep/mammotion_webrtc
+   Registered go2rtc stream mammotion_webrtc -> ...
+   ```
+   If registration fails (Frigate may lock the go2rtc REST API), add the source
+   statically to Frigate's `go2rtc.streams` instead:
+   ```yaml
+   go2rtc:
+     streams:
+       mammotion_webrtc: webrtc:http://mammotion-webrtc:8555/whep/mammotion_webrtc
+   ```
+4. **The real test** — open `http://<frigate-host>:1984/stream.html?src=mammotion_webrtc`.
+   Watch both logs while it connects: the bridge should log a WHEP POST + Agora
+   join + subscribe; go2rtc should show a producer. If video appears and is
+   smoother than the RTSP stream, the approach works. If go2rtc never negotiates
+   H.265 over the WHEP source, this is where it dead-ends.
+
+Known first-test failure modes (all expected for an untested port): SDP
+offer-shape mismatch, H.265 not negotiated by go2rtc's WHEP client, Agora edge
+address/area-code wrong, publisher dropping (RTM-vs-MQTT keep-alive). Capture
+both logs and we iterate.
+
 ## Status
 
 - [x] Feasibility assessment of PetKit code (codec-agnostic; port is tractable)
