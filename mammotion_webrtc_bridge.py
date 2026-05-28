@@ -29,7 +29,7 @@ Environment variables:
   GO2RTC_API_URL                         - go2rtc REST base (default http://frigate:1984)
   MAMMOTION_STREAM_NAME                  - go2rtc stream name (default mammotion)
   MAMMOTION_GO2RTC_RECONCILE_SECONDS     - periodic re-register interval
-                                           (default 20)
+                                            (default 20)
   MAMMOTION_KEEPALIVE_SECONDS            - MQTT keep-alive interval (default 10)
   MAMMOTION_RECONNECT_BACKOFF_SECONDS    - login retry backoff (default 8)
   MAMMOTION_AGORA_REJOIN_BACKOFF_SECONDS - Agora rejoin backoff (default 3)

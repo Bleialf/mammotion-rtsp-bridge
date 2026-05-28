@@ -73,6 +73,7 @@ class StreamCredentials:
     channel: str
     rtc_token: str
     uid: int
+    # Mammotion device/iot id for lifecycle logging and duplicate-session traces.
     device_id: str = ""
     # "CN,GLOBAL"-style area code string accepted by choose_server. Defaults to
     # global; the entrypoint maps Mammotion's areaCode if it can.
@@ -291,6 +292,7 @@ class MammotionWhepManager:
                             stream,
                             expected_session_id=session_id,
                             reason="Agora connection lost",
+                            allow_stale=True,
                         )
                     )
 
@@ -360,7 +362,7 @@ class MammotionWhepManager:
                         ),
                         attempt + 1,
                     )
-                    if attempt:
+                    if attempt > 0:
                         raise RuntimeError(
                             "Agora duplicate join persisted after retry "
                             + self._session_log_context(
@@ -463,6 +465,7 @@ class MammotionWhepManager:
         *,
         expected_session_id: str | None = None,
         reason: str,
+        allow_stale: bool = False,
     ) -> bool:
         """Close the Agora session for one stream while holding its lock."""
         async with self._lock:
@@ -477,7 +480,7 @@ class MammotionWhepManager:
                 expected_session_id,
                 session.session_id,
             )
-            return False
+            return allow_stale
 
         LOGGER.info(
             "Session cleanup start %s reason=%s",
@@ -519,6 +522,7 @@ class MammotionWhepManager:
         *,
         expected_session_id: str | None = None,
         reason: str = "requested",
+        allow_stale: bool = False,
     ) -> bool:
         """Close the Agora session for one stream."""
         stream_lock = await self._get_stream_lock(stream)
@@ -527,6 +531,7 @@ class MammotionWhepManager:
                 stream,
                 expected_session_id=expected_session_id,
                 reason=reason,
+                allow_stale=allow_stale,
             )
 
     async def close_all(self) -> None:
@@ -783,6 +788,7 @@ async def _handle_go2rtc_ws(request: web.Request) -> web.StreamResponse:
                 stream,
                 expected_session_id=current_session_id,
                 reason="go2rtc websocket disconnected",
+                allow_stale=True,
             )
 
     return ws

@@ -825,8 +825,10 @@ class AgoraWebSocketHandler:
                         if answer:
                             return answer
                     elif response.get("_result") == "failure":
+                        error_message = response.get("_message")
                         raise AgoraJoinError(
-                            str(response.get("_message", response)) or "join failed"
+                            str(error_message if error_message not in (None, "") else response)
+                            or "join failed"
                         )
 
         except TimeoutError:
