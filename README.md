@@ -76,8 +76,8 @@ Primary environment variables for WS passthrough:
 | `MAMMOTION_AGORA_REJOIN_BACKOFF_SECONDS` | `3` | Short backoff before a new Agora join after failure/cleanup |
 | `VIDEO_ONLY` | `false` | Answer only video media (audio/backchannel disabled) |
 | `MAMMOTION_WEBRTC_VIDEO_ONLY` | `false` | Legacy alias for `VIDEO_ONLY` |
-| `KEEP_AGORA_SESSION_ALIVE` | `false` | Keep upstream Agora session across downstream reconnects |
-| `KEEPALIVE_SECONDS` | `60` | Keep upstream alive window after last downstream disconnect |
+| `KEEPALIVE_AFTER_LAST_CLIENT_SECONDS` | `60` | Keep upstream alive window after last downstream disconnect |
+| `KEEPALIVE_SECONDS` | `60` | Legacy alias for `KEEPALIVE_AFTER_LAST_CLIENT_SECONDS` |
 | `MAMMOTION_AGORA_RTP_TIMEOUT_SECONDS` | `20` | Mark upstream unhealthy when media activity is stale |
 | `MAMMOTION_MIN_SESSION_LIFETIME_SECONDS` | `30` | Anti-flap minimum lifetime before non-definitive replacement |
 

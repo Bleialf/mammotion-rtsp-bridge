@@ -34,10 +34,11 @@ Environment variables:
   MAMMOTION_AGORA_REJOIN_BACKOFF_SECONDS - Agora rejoin backoff (default 3)
   VIDEO_ONLY                             - answer only video media (default false)
   MAMMOTION_WEBRTC_VIDEO_ONLY            - legacy alias for VIDEO_ONLY
-  KEEP_AGORA_SESSION_ALIVE               - keep upstream Agora session between
-                                           downstream reconnects (default false)
-  KEEPALIVE_SECONDS                      - keepalive window when enabled
+  KEEPALIVE_AFTER_LAST_CLIENT_SECONDS    - keep upstream Agora session alive
+                                           after last downstream disconnect
                                            (default 60)
+  KEEPALIVE_SECONDS                      - legacy alias for
+                                           KEEPALIVE_AFTER_LAST_CLIENT_SECONDS
   MAMMOTION_AGORA_RTP_TIMEOUT_SECONDS    - inactivity timeout for upstream
                                            replacement (default 20)
   MAMMOTION_MIN_SESSION_LIFETIME_SECONDS - anti-flap minimum replacement age
@@ -173,8 +174,12 @@ async def main() -> None:
         _env_int("MAMMOTION_AGORA_REJOIN_BACKOFF_SECONDS", 3)
     )
     video_only = _env_bool("VIDEO_ONLY", _env_bool("MAMMOTION_WEBRTC_VIDEO_ONLY", False))
-    keep_agora_session_alive = _env_bool("KEEP_AGORA_SESSION_ALIVE", False)
-    keepalive_seconds = float(_env_int("KEEPALIVE_SECONDS", 60))
+    keepalive_after_last_client_seconds = float(
+        _env_int(
+            "KEEPALIVE_AFTER_LAST_CLIENT_SECONDS",
+            _env_int("KEEPALIVE_SECONDS", 60),
+        )
+    )
     rtp_timeout_seconds = float(_env_int("MAMMOTION_AGORA_RTP_TIMEOUT_SECONDS", 20))
     min_session_lifetime_seconds = float(
         _env_int("MAMMOTION_MIN_SESSION_LIFETIME_SECONDS", 30)
@@ -310,8 +315,7 @@ async def main() -> None:
         publisher_wakeup=wake_publisher,
         reconnect_backoff_seconds=agora_rejoin_backoff,
         video_only=video_only,
-        keep_agora_session_alive=keep_agora_session_alive,
-        keepalive_seconds=keepalive_seconds,
+        keepalive_after_last_client_seconds=keepalive_after_last_client_seconds,
         rtp_timeout_seconds=rtp_timeout_seconds,
         min_session_lifetime_seconds=min_session_lifetime_seconds,
     )
@@ -329,7 +333,7 @@ async def main() -> None:
     whep_source = f"webrtc:ws://{whep_host}:{whep_port}/api/ws?src={stream_name}"
     LOGGER.info(
         "WHEP server listening on %s:%s; go2rtc signaling=%s source=%s video_only=%s "
-        "agora_rejoin_backoff=%.1fs keep_agora_session_alive=%s keepalive=%.1fs "
+        "agora_rejoin_backoff=%.1fs keepalive_after_last_client=%.1fs "
         "rtp_timeout=%.1fs min_lifetime=%.1fs",
         whep_bind,
         whep_port,
@@ -337,8 +341,7 @@ async def main() -> None:
         whep_source,
         video_only,
         agora_rejoin_backoff,
-        keep_agora_session_alive,
-        keepalive_seconds,
+        keepalive_after_last_client_seconds,
         rtp_timeout_seconds,
         min_session_lifetime_seconds,
     )

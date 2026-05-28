@@ -61,7 +61,7 @@ TOKEN_REFRESH_INTERVAL_SECONDS = 20 * 60
 MAX_JOIN_ATTEMPTS = 2
 DEFAULT_MIN_SESSION_LIFETIME_SECONDS = 30.0
 DEFAULT_RTP_TIMEOUT_SECONDS = 20.0
-DEFAULT_KEEPALIVE_SECONDS = 60.0
+DEFAULT_KEEPALIVE_AFTER_LAST_CLIENT_SECONDS = 60.0
 
 
 @dataclass
@@ -203,8 +203,7 @@ class MammotionWhepManager:
         publisher_wakeup: Callable[[], Awaitable[None]] | None = None,
         reconnect_backoff_seconds: float = 3.0,
         video_only: bool = False,
-        keep_agora_session_alive: bool = False,
-        keepalive_seconds: float = DEFAULT_KEEPALIVE_SECONDS,
+        keepalive_after_last_client_seconds: float = DEFAULT_KEEPALIVE_AFTER_LAST_CLIENT_SECONDS,
         min_session_lifetime_seconds: float = DEFAULT_MIN_SESSION_LIFETIME_SECONDS,
         rtp_timeout_seconds: float = DEFAULT_RTP_TIMEOUT_SECONDS,
     ) -> None:
@@ -217,8 +216,7 @@ class MammotionWhepManager:
         self._stream_locks: dict[str, asyncio.Lock] = {}
         self._reconnect_backoff_seconds = reconnect_backoff_seconds
         self._video_only = video_only
-        self._keep_agora_session_alive = keep_agora_session_alive
-        self._keepalive_seconds = keepalive_seconds
+        self._keepalive_after_last_client_seconds = keepalive_after_last_client_seconds
         self._min_session_lifetime_seconds = min_session_lifetime_seconds
         self._rtp_timeout_seconds = rtp_timeout_seconds
         self._retry_after: dict[str, float] = {}
@@ -620,6 +618,15 @@ class MammotionWhepManager:
 
         if state.cleanup_task is not None and not state.cleanup_task.done():
             state.cleanup_task.cancel()
+            LOGGER.info(
+                "New go2rtc client connected; canceled delayed Agora cleanup %s",
+                self._session_log_context(
+                    stream,
+                    upstream.session_id,
+                    upstream.channel,
+                    upstream.device_id,
+                ),
+            )
         state.cleanup_task = None
         return downstream_session_id, answer_sdp
 
@@ -810,6 +817,16 @@ class MammotionWhepManager:
             downstream_id = state.owner_current_session.pop(owner_client_id, None)
             if downstream_id:
                 state.connected_clients.pop(downstream_id, None)
+            if state.active_agora_session is not None:
+                LOGGER.info(
+                    "go2rtc client disconnected; keeping Agora session alive %s",
+                    self._session_log_context(
+                        stream,
+                        state.active_agora_session.session_id,
+                        state.active_agora_session.channel,
+                        state.active_agora_session.device_id,
+                    ),
+                )
             await self._maybe_cleanup_upstream_locked(
                 stream,
                 state,
@@ -831,39 +848,27 @@ class MammotionWhepManager:
             return False
         if state.connected_clients:
             return True
-        if owner_client_id != upstream.owner_client_id:
-            LOGGER.info(
-                "Skipping upstream cleanup for non-owner disconnect stream=%s owner=%s active_owner=%s",
+        if state.cleanup_task is not None and not state.cleanup_task.done():
+            state.cleanup_task.cancel()
+        state.cleanup_task = asyncio.create_task(
+            self._delayed_cleanup(
                 stream,
-                owner_client_id,
-                upstream.owner_client_id,
+                expected_upstream_session_id=upstream.session_id,
+                delay_seconds=self._keepalive_after_last_client_seconds,
             )
-            return True
-
-        if self._keep_agora_session_alive:
-            if state.cleanup_task is not None and not state.cleanup_task.done():
-                state.cleanup_task.cancel()
-            state.cleanup_task = asyncio.create_task(
-                self._delayed_cleanup(
-                    stream,
-                    expected_upstream_session_id=upstream.session_id,
-                    delay_seconds=self._keepalive_seconds,
-                )
-            )
-            LOGGER.info(
-                "Keeping Agora session alive stream=%s session=%s for %.1fs",
+        )
+        LOGGER.info(
+            "No downstream clients; scheduling Agora cleanup in %.0fs %s reason=%s",
+            self._keepalive_after_last_client_seconds,
+            self._session_log_context(
                 stream,
                 upstream.session_id,
-                self._keepalive_seconds,
-            )
-            return True
-
-        return await self._close_upstream_locked(
-            stream,
-            state,
-            expected_upstream_session_id=upstream.session_id,
-            reason=reason,
+                upstream.channel,
+                upstream.device_id,
+            ),
+            reason,
         )
+        return True
 
     async def _delayed_cleanup(
         self,
@@ -880,6 +885,13 @@ class MammotionWhepManager:
                 state = await self._get_state(stream)
                 if state.connected_clients:
                     return
+                LOGGER.info(
+                    "Agora keepalive expired; closing upstream session %s",
+                    self._session_log_context(
+                        stream,
+                        expected_upstream_session_id,
+                    ),
+                )
                 await self._close_upstream_locked(
                     stream,
                     state,
@@ -1203,8 +1215,7 @@ def create_whep_app(
     publisher_wakeup: Callable[[], Awaitable[None]] | None = None,
     reconnect_backoff_seconds: float = 3.0,
     video_only: bool = False,
-    keep_agora_session_alive: bool = False,
-    keepalive_seconds: float = DEFAULT_KEEPALIVE_SECONDS,
+    keepalive_after_last_client_seconds: float = DEFAULT_KEEPALIVE_AFTER_LAST_CLIENT_SECONDS,
     min_session_lifetime_seconds: float = DEFAULT_MIN_SESSION_LIFETIME_SECONDS,
     rtp_timeout_seconds: float = DEFAULT_RTP_TIMEOUT_SECONDS,
 ) -> web.Application:
@@ -1221,8 +1232,7 @@ def create_whep_app(
         publisher_wakeup=publisher_wakeup,
         reconnect_backoff_seconds=reconnect_backoff_seconds,
         video_only=video_only,
-        keep_agora_session_alive=keep_agora_session_alive,
-        keepalive_seconds=keepalive_seconds,
+        keepalive_after_last_client_seconds=keepalive_after_last_client_seconds,
         min_session_lifetime_seconds=min_session_lifetime_seconds,
         rtp_timeout_seconds=rtp_timeout_seconds,
     )
