@@ -150,9 +150,15 @@ class MammotionWhepManager:
     a single mower stream; the manager still supports several).
     """
 
-    def __init__(self, credentials_provider: StreamCredentialsProvider) -> None:
+    def __init__(
+        self,
+        credentials_provider: StreamCredentialsProvider,
+        *,
+        publisher_wakeup: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         """Store the credentials provider and per-stream session state."""
         self._credentials_provider = credentials_provider
+        self._publisher_wakeup = publisher_wakeup
         self._lock = asyncio.Lock()
         self._sessions: dict[str, AgoraUpstreamSession] = {}
 
@@ -162,6 +168,15 @@ class MammotionWhepManager:
         # and offered codecs vs. the answer we build.
         LOGGER.info("go2rtc WHEP offer SDP:\n%s", offer_sdp)
         await self.close_session(stream)
+
+        # Force the mower into the Agora channel with video on BEFORE we open
+        # the upstream WS. Mammotion's publisher otherwise idles when the only
+        # subscriber is go2rtc (no app viewer). Best-effort: never block negotiation.
+        if self._publisher_wakeup is not None:
+            try:
+                await self._publisher_wakeup()
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Publisher wakeup failed (continuing)")
 
         credentials = await self._credentials_provider()
         for field_name in ("app_id", "channel", "rtc_token"):
@@ -402,6 +417,7 @@ def create_whep_app(
     credentials_provider: StreamCredentialsProvider,
     *,
     auth_token: str | None = None,
+    publisher_wakeup: Callable[[], Awaitable[None]] | None = None,
 ) -> web.Application:
     """Build the standalone aiohttp WHEP application.
 
@@ -411,7 +427,10 @@ def create_whep_app(
       * ``DELETE /whep/{stream}/{session_id}``     -> teardown
     """
     app = web.Application()
-    manager = MammotionWhepManager(credentials_provider)
+    manager = MammotionWhepManager(
+        credentials_provider,
+        publisher_wakeup=publisher_wakeup,
+    )
     app[_MANAGER_KEY] = manager
     app[_TOKEN_KEY] = auth_token
 
