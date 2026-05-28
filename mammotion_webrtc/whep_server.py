@@ -212,6 +212,15 @@ class MammotionWhepManager:
             asyncio.get_running_loop().time() + self._reconnect_backoff_seconds
         )
 
+    async def _handle_join_failure(
+        self,
+        stream: str,
+        agora_handler: AgoraWebSocketHandler,
+    ) -> None:
+        """Tear down failed local join state and apply reconnect backoff."""
+        await agora_handler.disconnect()
+        self._set_reconnect_backoff(stream)
+
     async def create_session(
         self,
         stream: str,
@@ -340,8 +349,7 @@ class MammotionWhepManager:
                     )
                     break
                 except AgoraDuplicateJoinError:
-                    await agora_handler.disconnect()
-                    self._set_reconnect_backoff(stream)
+                    await self._handle_join_failure(stream, agora_handler)
                     LOGGER.warning(
                         "Agora duplicate join detected %s attempt=%d",
                         self._session_log_context(
@@ -359,13 +367,11 @@ class MammotionWhepManager:
                     agora_response = await refresh_agora_context(credentials)
                     continue
                 except Exception:
-                    await agora_handler.disconnect()
-                    self._set_reconnect_backoff(stream)
+                    await self._handle_join_failure(stream, agora_handler)
                     raise
 
             if not answer_sdp:
-                await agora_handler.disconnect()
-                self._set_reconnect_backoff(stream)
+                await self._handle_join_failure(stream, agora_handler)
                 raise RuntimeError(
                     "Agora upstream negotiation did not return an SDP answer"
                 )
