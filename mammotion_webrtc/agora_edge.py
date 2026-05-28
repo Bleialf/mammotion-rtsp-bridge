@@ -1380,9 +1380,29 @@ class AgoraWebSocketHandler:
         "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
     )
 
+    @staticmethod
+    def _dedupe_rtcp_feedbacks(
+        feedbacks: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Drop duplicate ``(type, parameter)`` entries while preserving order.
+
+        Agora's ORTC reply contains duplicate ``nack``/``nack pli`` entries.
+        Chrome tolerates duplicate ``a=rtcp-fb`` lines; Pion (go2rtc) is
+        stricter and may reject the whole m-line.
+        """
+        seen: set[tuple[str, str]] = set()
+        out: list[dict[str, Any]] = []
+        for feedback in feedbacks or []:
+            key = (str(feedback.get("type", "")), str(feedback.get("parameter", "")))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(feedback)
+        return out
+
     @classmethod
     def _strip_transport_cc(cls, capabilities: dict[str, Any]) -> dict[str, Any]:
-        """Return a copy of caps with transport-cc extension + rtcp-fb removed."""
+        """Return a copy of caps with transport-cc removed + rtcp-fb deduped."""
         munged = dict(capabilities)
         for ext_key in ("audioExtensions", "videoExtensions"):
             munged[ext_key] = [
@@ -1393,10 +1413,11 @@ class AgoraWebSocketHandler:
             new_codecs = []
             for codec in (munged.get(codec_key) or []):
                 codec_copy = dict(codec)
-                codec_copy["rtcpFeedbacks"] = [
+                rtcp_fbs = [
                     fb for fb in (codec.get("rtcpFeedbacks") or [])
                     if fb.get("type") != "transport-cc"
                 ]
+                codec_copy["rtcpFeedbacks"] = cls._dedupe_rtcp_feedbacks(rtcp_fbs)
                 new_codecs.append(codec_copy)
             munged[codec_key] = new_codecs
         return munged
@@ -1433,6 +1454,10 @@ class AgoraWebSocketHandler:
         libwebrtc (mikey0000's HA case) accepts that; Pion in go2rtc accepts it
         too per RFC 5245 but only IPv4 is reachable from a typical Docker
         bridge network, so we drop IPv6 host candidates.
+
+        Appends ``a=end-of-candidates`` so Pion (go2rtc) knows the candidate
+        list is complete and can start ICE checks immediately rather than
+        waiting for trickle that will never arrive.
         """
         candidate_lines: list[str] = []
         for index, candidate in enumerate(candidates):
@@ -1455,6 +1480,8 @@ class AgoraWebSocketHandler:
             if candidate.get("generation") is not None:
                 line += f" generation {candidate['generation']}"
             candidate_lines.append(line)
+        if candidate_lines:
+            candidate_lines.append("a=end-of-candidates")
         return candidate_lines
 
     @staticmethod
