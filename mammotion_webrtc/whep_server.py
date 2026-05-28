@@ -407,6 +407,12 @@ async def _handle_whep_post(request: web.Request) -> web.Response:
 
     user_agent = request.headers.get("User-Agent", "")
     pion_compat = "Go-http-client" in user_agent or "go2rtc" in user_agent.lower()
+    LOGGER.info(
+        "WHEP client stream=%s user_agent=%s pion_compat=%s",
+        stream,
+        user_agent or "<empty>",
+        pion_compat,
+    )
 
     manager = request.app[_MANAGER_KEY]
     try:
