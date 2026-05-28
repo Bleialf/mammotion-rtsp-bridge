@@ -849,6 +849,9 @@ class AgoraWebSocketHandler:
                 err,
             )
             self._connection_state = "DISCONNECTED"
+        except AgoraJoinError:
+            self._connection_state = "DISCONNECTED"
+            raise
 
         return None
 
@@ -879,6 +882,9 @@ class AgoraWebSocketHandler:
             raise
         except WebSocketException as err:
             LOGGER.warning("Agora message loop closed %s: %s", self._log_context(), err)
+            self._fire_connection_lost()
+        except Exception as err:  # noqa: BLE001
+            LOGGER.warning("Agora message loop error %s: %s", self._log_context(), err)
             self._fire_connection_lost()
         finally:
             self._connection_state = "DISCONNECTED"
