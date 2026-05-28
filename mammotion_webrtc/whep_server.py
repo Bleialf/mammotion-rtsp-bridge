@@ -858,7 +858,7 @@ class MammotionWhepManager:
             )
         )
         LOGGER.info(
-            "No downstream clients; scheduling Agora cleanup in %.0fs %s reason=%s",
+            "No downstream clients; scheduling Agora cleanup in %.1fs for %s (reason=%s)",
             self._keepalive_after_last_client_seconds,
             self._session_log_context(
                 stream,
@@ -885,12 +885,22 @@ class MammotionWhepManager:
                 state = await self._get_state(stream)
                 if state.connected_clients:
                     return
+                session = state.active_agora_session
+                if session is None:
+                    log_context = self._session_log_context(
+                        stream,
+                        session_id=expected_upstream_session_id,
+                    )
+                else:
+                    log_context = self._session_log_context(
+                        stream,
+                        session_id=expected_upstream_session_id,
+                        channel=session.channel,
+                        device_id=session.device_id,
+                    )
                 LOGGER.info(
                     "Agora keepalive expired; closing upstream session %s",
-                    self._session_log_context(
-                        stream,
-                        expected_upstream_session_id,
-                    ),
+                    log_context,
                 )
                 await self._close_upstream_locked(
                     stream,
