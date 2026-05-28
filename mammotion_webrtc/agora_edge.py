@@ -884,7 +884,12 @@ class AgoraWebSocketHandler:
             LOGGER.warning("Agora message loop closed %s: %s", self._log_context(), err)
             self._fire_connection_lost()
         except Exception as err:  # noqa: BLE001
-            LOGGER.warning("Agora message loop error %s: %s", self._log_context(), err)
+            LOGGER.warning(
+                "Agora message loop encountered unexpected %s %s: %s",
+                type(err).__name__,
+                self._log_context(),
+                err,
+            )
             self._fire_connection_lost()
         finally:
             self._connection_state = "DISCONNECTED"

@@ -361,7 +361,15 @@ class MammotionWhepManager:
                         attempt + 1,
                     )
                     if attempt:
-                        raise RuntimeError("Agora duplicate join persisted after retry")
+                        raise RuntimeError(
+                            "Agora duplicate join persisted after retry "
+                            + self._session_log_context(
+                                stream,
+                                session_id,
+                                credentials.channel,
+                                credentials.device_id,
+                            )
+                        )
                     await self._wait_for_reconnect_backoff(stream)
                     credentials = await self._credentials_provider()
                     agora_response = await refresh_agora_context(credentials)
