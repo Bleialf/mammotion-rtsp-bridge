@@ -1,6 +1,6 @@
-# EXPERIMENTAL — WebRTC/WHEP passthrough bridge (branch: webrtc-passthrough).
-# Runs alongside (not instead of) your working RTSP bridge, using a distinct
-# stream name `mammotion_webrtc` so you can A/B compare. Build from this branch.
+# WebRTC WS passthrough bridge (WS-only, recommended path).
+# Runs alongside (not instead of) your existing stream setup, using a distinct
+# stream name `mammotion_webrtc` so you can A/B compare safely.
 #
 # Paste this service into your Frigate compose (so it shares Frigate's network
 # and can reach `frigate:1984` + be reached at `mammotion-webrtc:8555`), or run
@@ -9,8 +9,8 @@
 services:
   mammotion-webrtc:
     container_name: mammotion-webrtc
-    # Prebuilt experimental image (amd64) from the webrtc-passthrough branch.
-    image: ghcr.io/bleialf/mammotion-rtsp-bridge:webrtc-test
+    # Released image tag (multi-arch).
+    image: ghcr.io/bleialf/mammotion-rtsp-bridge:0.1.2
     # ...or build locally from the branch checkout instead:
     # build:
     #   context: .
@@ -25,13 +25,11 @@ services:
       GO2RTC_API_URL: "http://frigate:1984"
       # Distinct name so it coexists with your existing `mammotion` RTSP stream:
       MAMMOTION_STREAM_NAME: "mammotion_webrtc"
-      # Hostname go2rtc uses to dial our WHEP server — must equal this
-      # container's network name:
+      # Legacy var names retained for compatibility; these define the host/port
+      # go2rtc uses to dial the bridge WS endpoint.
       MAMMOTION_WHEP_HOST: "mammotion-webrtc"
       MAMMOTION_WHEP_PORT: "8555"
-      # Use go2rtc-native WS signaling instead of one-shot WHEP client.
-      # This path supports async trickle candidates and works around Pion/WHEP
-      # interop issues seen with Agora edge.
+      # WS signaling is the only supported mode.
       MAMMOTION_GO2RTC_SIGNALING: "ws"
       # Reconcile go2rtc registration periodically so Frigate/go2rtc restarts
       # do not leave the stream missing.
