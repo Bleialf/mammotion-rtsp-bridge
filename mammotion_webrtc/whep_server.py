@@ -143,7 +143,7 @@ async def refresh_agora_context(credentials: StreamCredentials) -> AgoraResponse
 
 @dataclass
 class AgoraUpstreamSession:
-    """One active upstream Agora session for a stream/device."""
+    """One active upstream Agora session shared by downstream WHEP/WS clients."""
 
     # Public stream name exposed to go2rtc/WHEP.
     stream: str
@@ -192,6 +192,9 @@ class MammotionWhepManager:
     minus HA bookkeeping. Sessions are keyed by stream name (Mammotion exposes
     a single mower stream; the manager still supports several).
     """
+    _DEFINITIVE_FAILURE_REASONS = frozenset(
+        {"websocket_closed", "p2p_lost", "setup_failed"}
+    )
 
     def __init__(
         self,
@@ -314,7 +317,7 @@ class MammotionWhepManager:
                         owner_client_id=owner,
                     )
                 if age < self._min_session_lifetime_seconds and not definitive_failure:
-                    LOGGER.info(
+                    LOGGER.warning(
                         "Anti-flap guard keeping young session %s age=%.1fs reason=%s",
                         self._session_log_context(
                             stream,
@@ -632,7 +635,7 @@ class MammotionWhepManager:
             return False, "websocket_closed", True
         if not state.healthy:
             reason = state.unhealthy_reason or "unhealthy"
-            definitive = reason in {"websocket_closed", "p2p_lost", "setup_failed"}
+            definitive = reason in self._DEFINITIVE_FAILURE_REASONS
             return False, reason, definitive
         if self._rtp_timeout_seconds > 0 and state.last_rtp_at > 0:
             age = self._loop.time() - state.last_rtp_at
@@ -742,6 +745,8 @@ class MammotionWhepManager:
         if state.cleanup_task is not None and not state.cleanup_task.done():
             current_task = asyncio.current_task()
             state.cleanup_task.cancel()
+            # _delayed_cleanup eventually calls _close_upstream_locked itself, so
+            # avoid awaiting the same task from within that task.
             if state.cleanup_task is not current_task:
                 with contextlib.suppress(asyncio.CancelledError):
                     await state.cleanup_task

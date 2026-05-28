@@ -1919,6 +1919,8 @@ class AgoraWebSocketHandler:
         ortc = self._active_answer_ortc or self._pending_answer_ortc
         if ortc is None:
             return self._answer_sdp
+        if self._active_answer_ortc is None:
+            LOGGER.debug("Generating answer from pending ORTC state %s", self._log_context())
 
         previous_pion_compat = self._pion_compat
         if pion_compat is not None:
@@ -1933,9 +1935,10 @@ class AgoraWebSocketHandler:
 
     def _fire_connection_lost(self, reason: str) -> None:
         """Notify the owner that the Agora connection dropped unexpectedly."""
-        if self._on_connection_lost is not None:
-            self._on_connection_lost(reason)
-            self._on_connection_lost = None
+        callback = self._on_connection_lost
+        self._on_connection_lost = None
+        if callback is not None:
+            callback(reason)
 
     async def disconnect(self) -> None:
         """Close websocket and cancel background tasks."""
