@@ -28,10 +28,11 @@ Environment variables:
   MAMMOTION_WHEP_TOKEN                   - optional static bearer token
   GO2RTC_API_URL                         - go2rtc REST base (default http://frigate:1984)
   MAMMOTION_STREAM_NAME                  - go2rtc stream name (default mammotion)
-    MAMMOTION_GO2RTC_RECONCILE_SECONDS     - periodic re-register interval
-                                                                                     (default 20)
+  MAMMOTION_GO2RTC_RECONCILE_SECONDS     - periodic re-register interval (default 20)
   MAMMOTION_KEEPALIVE_SECONDS            - MQTT keep-alive interval (default 10)
   MAMMOTION_RECONNECT_BACKOFF_SECONDS    - login retry backoff (default 8)
+  MAMMOTION_AGORA_REJOIN_BACKOFF_SECONDS - Agora rejoin backoff (default 3)
+  MAMMOTION_WEBRTC_VIDEO_ONLY            - answer audio as inactive (default false)
 """
 
 from __future__ import annotations
@@ -126,6 +127,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 async def main() -> None:
     """Run the bridge: login, WHEP server, go2rtc registration, keep-alive."""
     log_level = os.getenv("MAMMOTION_LOG_LEVEL", "INFO").upper()
@@ -152,6 +160,10 @@ async def main() -> None:
     go2rtc_reconcile_interval = float(_env_int("MAMMOTION_GO2RTC_RECONCILE_SECONDS", 20))
     keepalive_interval = float(_env_int("MAMMOTION_KEEPALIVE_SECONDS", 10))
     reconnect_backoff = _env_int("MAMMOTION_RECONNECT_BACKOFF_SECONDS", 8)
+    agora_rejoin_backoff = float(
+        _env_int("MAMMOTION_AGORA_REJOIN_BACKOFF_SECONDS", 3)
+    )
+    video_only = _env_bool("MAMMOTION_WEBRTC_VIDEO_ONLY", False)
 
     LOGGER.info("Loading Mammotion SDK modules")
     from pymammotion.client import MammotionClient
@@ -200,6 +212,7 @@ async def main() -> None:
             channel=str(fields["channelName"]),
             rtc_token=str(fields["token"]),
             uid=int(fields["uid"]),
+            device_id=str(fields.get("iot_id") or ""),
             area_code=resolve_area_code_string(fields.get("areaCode")),
         )
 
@@ -220,6 +233,12 @@ async def main() -> None:
         if mammotion is None or (cached is not None and now - last < CREDS_DEBOUNCE_S):
             if cached is None:
                 raise RuntimeError("Mammotion credentials not ready")
+            LOGGER.info(
+                "Reusing cached stream subscription device=%s channel=%s age=%.1fs",
+                cached.device_id or state.get("iot_id") or "<unknown>",
+                cached.channel,
+                now - last,
+            )
             return cached
         try:
             fields = await fetch_stream_fields(mammotion, state["device_name"])
@@ -230,7 +249,11 @@ async def main() -> None:
             state["iot_id"] = fields["iot_id"]
             state["credentials"] = _creds_from_fields(fields)
             state["creds_fetched_at"] = now
-            LOGGER.info("Re-triggered mower publish via get_stream_subscription")
+            LOGGER.info(
+                "Refreshed stream subscription device=%s channel=%s",
+                fields["iot_id"],
+                fields["channelName"],
+            )
         except Exception:
             LOGGER.exception("Credential refresh failed; using cached if available")
             if cached is None:
@@ -270,6 +293,8 @@ async def main() -> None:
         credentials_provider,
         auth_token=whep_token,
         publisher_wakeup=wake_publisher,
+        reconnect_backoff_seconds=agora_rejoin_backoff,
+        video_only=video_only,
     )
     runner = web.AppRunner(app)
     await runner.setup()
@@ -284,11 +309,14 @@ async def main() -> None:
         go2rtc_signaling = "ws"
     whep_source = f"webrtc:ws://{whep_host}:{whep_port}/api/ws?src={stream_name}"
     LOGGER.info(
-        "WHEP server listening on %s:%s; go2rtc signaling=%s source=%s",
+        "WHEP server listening on %s:%s; go2rtc signaling=%s source=%s video_only=%s "
+        "agora_rejoin_backoff=%.1fs",
         whep_bind,
         whep_port,
         go2rtc_signaling,
         whep_source,
+        video_only,
+        agora_rejoin_backoff,
     )
 
     registrar: Go2RTCStreamRegistrar | None = None

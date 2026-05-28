@@ -48,6 +48,15 @@ LOGGER = logging.getLogger(__name__)
 # subscribe calls (agora_websocket.py ~553, ~642, ~679 / join_v3 codec).
 # Changed here; the SDP builders themselves stay codec-agnostic.
 DEFAULT_VIDEO_CODEC = "h265"
+ERR_REPEAT_JOIN = "ERR_REPEAT_JOIN"
+
+
+class AgoraJoinError(RuntimeError):
+    """Base error for Agora join/signaling failures."""
+
+
+class AgoraDuplicateJoinError(AgoraJoinError):
+    """Raised when Agora rejects a join as a duplicate/stale session."""
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +601,10 @@ class AgoraWebSocketHandler:
         self._message_handlers: dict[str, Callable[[dict[str, Any]], Any]] = {}
         self._disconnect_task: asyncio.Task[None] | None = None
         self._on_connection_lost = on_connection_lost
+        self._stream_name = ""
+        self._session_id = ""
+        self._device_id = ""
+        self._channel_name = ""
 
         self.candidates: list[RTCIceCandidateInit] = []
         self._online_users: set[int] = set()
@@ -620,6 +633,33 @@ class AgoraWebSocketHandler:
 
         self._setup_message_handlers()
 
+    def set_log_context(
+        self,
+        *,
+        stream: str,
+        session_id: str,
+        channel: str = "",
+        device_id: str = "",
+    ) -> None:
+        """Attach stream/session context for lifecycle logging."""
+        self._stream_name = stream
+        self._session_id = session_id
+        self._channel_name = channel
+        self._device_id = device_id
+
+    def _log_context(self) -> str:
+        """Return a compact log context string."""
+        parts = []
+        if self._stream_name:
+            parts.append(f"stream={self._stream_name}")
+        if self._device_id:
+            parts.append(f"device={self._device_id}")
+        if self._channel_name:
+            parts.append(f"channel={self._channel_name}")
+        if self._session_id:
+            parts.append(f"session={self._session_id}")
+        return " ".join(parts)
+
     def _setup_message_handlers(self) -> None:
         """Register incoming message handlers."""
         self._message_handlers = {
@@ -645,6 +685,8 @@ class AgoraWebSocketHandler:
     ) -> str | None:
         """Connect to Agora edge WebSocket and return answer SDP."""
         self._rtc_token = live_feed.rtc_token
+        self._session_id = session_id
+        self._channel_name = live_feed.channel_id or self._channel_name
 
         offer_info = self._parse_offer_sdp(offer_sdp)
         if offer_info is None:
@@ -694,7 +736,11 @@ class AgoraWebSocketHandler:
 
                 self._websocket = websocket
                 self._connection_state = "CONNECTED"
-                LOGGER.info("Connected to Agora WebSocket: %s", ws_url)
+                LOGGER.info(
+                    "Connected to Agora WebSocket %s %s",
+                    self._log_context(),
+                    ws_url,
+                )
 
                 join_message = self._create_join_message(
                     live_feed=live_feed,
@@ -779,6 +825,17 @@ class AgoraWebSocketHandler:
                         )
                         if answer:
                             return answer
+                    elif response.get("_result") == "failure":
+                        error_message = response.get("_message")
+                        if error_message not in (None, ""):
+                            join_error = str(error_message)
+                        elif response:
+                            join_error = str(response)
+                        else:
+                            join_error = "join failed"
+                        raise AgoraJoinError(
+                            join_error
+                        )
 
         except TimeoutError:
             if (
@@ -792,10 +849,17 @@ class AgoraWebSocketHandler:
                 answer = self._finalize_pending_answer()
                 if answer:
                     return answer
-            LOGGER.error("Timeout waiting for join_v3 response")
+            LOGGER.error("Timeout waiting for join_v3 response %s", self._log_context())
         except WebSocketException as err:
-            LOGGER.error("WebSocket error while waiting for join response: %s", err)
+            LOGGER.error(
+                "WebSocket error while waiting for join response %s: %s",
+                self._log_context(),
+                err,
+            )
             self._connection_state = "DISCONNECTED"
+        except AgoraJoinError:
+            self._connection_state = "DISCONNECTED"
+            raise
 
         return None
 
@@ -825,7 +889,16 @@ class AgoraWebSocketHandler:
             LOGGER.debug("Agora message loop cancelled")
             raise
         except WebSocketException as err:
-            LOGGER.warning("Agora message loop closed: %s", err)
+            LOGGER.warning("Agora message loop closed %s: %s", self._log_context(), err)
+            self._fire_connection_lost()
+        except Exception as err:  # noqa: BLE001
+            LOGGER.warning(
+                "Agora message loop encountered unexpected %s %s: %s",
+                type(err).__name__,
+                self._log_context(),
+                err,
+                exc_info=True,
+            )
             self._fire_connection_lost()
         finally:
             self._connection_state = "DISCONNECTED"
@@ -955,7 +1028,8 @@ class AgoraWebSocketHandler:
     async def _handle_p2p_lost(self, response: dict[str, Any]) -> None:
         """Handle p2p_lost signaling."""
         LOGGER.warning(
-            "Agora p2p_lost: code=%s error=%s",
+            "Agora p2p_lost %s: code=%s error=%s",
+            self._log_context(),
             response.get("error_code"),
             response.get("error_str"),
         )
@@ -965,7 +1039,10 @@ class AgoraWebSocketHandler:
     async def _handle_error(self, response: dict[str, Any]) -> None:
         """Handle generic Agora signaling errors."""
         message = response.get("_message", {})
-        LOGGER.error("Agora error message: %s", message.get("error", message))
+        error_text = str(message.get("error", message))
+        LOGGER.error("Agora error %s: %s", self._log_context(), error_text)
+        if ERR_REPEAT_JOIN in error_text:
+            raise AgoraDuplicateJoinError(error_text)
 
     async def _handle_rtp_capability_change(self, response: dict[str, Any]) -> None:
         """Handle capability updates."""
@@ -1830,6 +1907,7 @@ class AgoraWebSocketHandler:
 
     async def disconnect(self) -> None:
         """Close websocket and cancel background tasks."""
+        LOGGER.info("Agora disconnect start %s", self._log_context())
         tasks_to_wait: list[asyncio.Task[None]] = []
         current_task = asyncio.current_task()
 
@@ -1866,3 +1944,4 @@ class AgoraWebSocketHandler:
         self._connection_state = "DISCONNECTED"
         self._video_streams.clear()
         self._subscribed_video_streams.clear()
+        LOGGER.info("Agora disconnect complete %s", self._log_context())
