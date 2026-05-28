@@ -2,7 +2,7 @@ name: Build and publish Docker image
 
 on:
   push:
-    branches: [main]
+    branches: [main, webrtc-passthrough]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -45,6 +45,8 @@ jobs:
             # Rolling dev: every push to main -> :latest (+ :sha-<commit>)
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-
+            # webrtc-passthrough branch -> :webrtc-test (experimental image)
+            type=raw,value=webrtc-test,enable=${{ github.ref == 'refs/heads/webrtc-passthrough' }}
             # Releases: tag v1.2.3 -> :1.2.3, :1.2, :1, and :stable
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
