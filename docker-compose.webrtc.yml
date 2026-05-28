@@ -1,0 +1,48 @@
+# EXPERIMENTAL — WebRTC/WHEP passthrough bridge (branch: webrtc-passthrough).
+# Runs alongside (not instead of) your working RTSP bridge, using a distinct
+# stream name `mammotion_webrtc` so you can A/B compare. Build from this branch.
+#
+# Paste this service into your Frigate compose (so it shares Frigate's network
+# and can reach `frigate:1984` + be reached at `mammotion-webrtc:8555`), or run
+# it as its own project attached to Frigate's network (see networks note).
+
+services:
+  mammotion-webrtc:
+    container_name: mammotion-webrtc
+    # Prebuilt experimental image (amd64) from the webrtc-passthrough branch.
+    image: ghcr.io/bleialf/mammotion-rtsp-bridge:webrtc-test
+    # ...or build locally from the branch checkout instead:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      BRIDGE_SCRIPT: "mammotion_webrtc_bridge.py"   # selects the WebRTC entrypoint
+      MAMMOTION_EMAIL: "your@email.com"
+      MAMMOTION_PASSWORD: "your-password"
+      MAMMOTION_DEVICE_NAME: "first"
+      # go2rtc REST API (Frigate's bundled go2rtc) for stream registration:
+      GO2RTC_API_URL: "http://frigate:1984"
+      # Distinct name so it coexists with your existing `mammotion` RTSP stream:
+      MAMMOTION_STREAM_NAME: "mammotion_webrtc"
+      # Hostname go2rtc uses to dial our WHEP server — must equal this
+      # container's network name:
+      MAMMOTION_WHEP_HOST: "mammotion-webrtc"
+      MAMMOTION_WHEP_PORT: "8555"
+      # Use go2rtc-native WS signaling instead of one-shot WHEP client.
+      # This path supports async trickle candidates and works around Pion/WHEP
+      # interop issues seen with Agora edge.
+      MAMMOTION_GO2RTC_SIGNALING: "ws"
+      # Reconcile go2rtc registration periodically so Frigate/go2rtc restarts
+      # do not leave the stream missing.
+      MAMMOTION_GO2RTC_RECONCILE_SECONDS: "20"
+      MAMMOTION_KEEPALIVE_SECONDS: "10"
+
+    # If this is a SEPARATE compose project from Frigate, attach to Frigate's
+    # network (find it with `docker network ls`) so `frigate` resolves:
+    # networks:
+    #   - frigate_net
+# networks:
+#   frigate_net:
+#     external: true
+#     name: frigate_default

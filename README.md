@@ -50,6 +50,41 @@ Mammotion cloud ── Agora (HEVC) ──▶ bridge (ffmpeg → H.264) ──RT
 The prebuilt image (`ghcr.io/bleialf/mammotion-rtsp-bridge:latest`, amd64 +
 arm64) is pulled automatically — no build step needed.
 
+## WebRTC passthrough mode (new in 0.1.2)
+
+In addition to the default RTSP-transcode bridge, this repo now includes an
+experimental direct WebRTC passthrough mode designed for go2rtc/Frigate.
+
+Instead of decoding and re-encoding video with ffmpeg, this mode brokers
+WebRTC signaling between go2rtc and Mammotion's Agora edge.
+
+```
+Mammotion cloud ── Agora WebRTC ──▶ bridge (signaling only) ──▶ go2rtc/Frigate WebRTC
+```
+
+Use the dedicated example compose file:
+
+- [docker-compose.webrtc.yml](docker-compose.webrtc.yml)
+
+Key environment variables for passthrough mode:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `BRIDGE_SCRIPT` | `mammotion_go2rtc_bridge.py` | Set to `mammotion_webrtc_bridge.py` for passthrough mode |
+| `GO2RTC_API_URL` | `http://frigate:1984` | go2rtc API used for stream registration |
+| `MAMMOTION_STREAM_NAME` | `mammotion` | Stream name created/maintained in go2rtc |
+| `MAMMOTION_WHEP_HOST` | container hostname | Hostname go2rtc uses to reach this bridge |
+| `MAMMOTION_WHEP_PORT` | `8555` | WHEP/WS signaling listen port |
+| `MAMMOTION_GO2RTC_SIGNALING` | `http` | Signaling mode: `http` (WHEP) or `ws` (go2rtc-native WS) |
+| `MAMMOTION_GO2RTC_RECONCILE_SECONDS` | `20` | Periodically re-ensures stream registration after go2rtc/Frigate restarts |
+| `MAMMOTION_KEEPALIVE_SECONDS` | `10` | MQTT keep-alive cadence to keep the mower publishing |
+
+Recommended for Frigate/go2rtc right now:
+
+- Set `MAMMOTION_GO2RTC_SIGNALING=ws`.
+- Keep `MAMMOTION_GO2RTC_RECONCILE_SECONDS` enabled so stream registration
+  self-heals after Frigate restarts.
+
 ### Example: bridge alongside Frigate
 
 The bridge just needs to reach Frigate's go2rtc, so the simplest setup is to
