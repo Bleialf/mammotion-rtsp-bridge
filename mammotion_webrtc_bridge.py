@@ -32,7 +32,16 @@ Environment variables:
   MAMMOTION_KEEPALIVE_SECONDS            - MQTT keep-alive interval (default 10)
   MAMMOTION_RECONNECT_BACKOFF_SECONDS    - login retry backoff (default 8)
   MAMMOTION_AGORA_REJOIN_BACKOFF_SECONDS - Agora rejoin backoff (default 3)
-  MAMMOTION_WEBRTC_VIDEO_ONLY            - answer audio as inactive (default false)
+  VIDEO_ONLY                             - answer only video media (default false)
+  MAMMOTION_WEBRTC_VIDEO_ONLY            - legacy alias for VIDEO_ONLY
+  KEEP_AGORA_SESSION_ALIVE               - keep upstream Agora session between
+                                           downstream reconnects (default false)
+  KEEPALIVE_SECONDS                      - keepalive window when enabled
+                                           (default 60)
+  MAMMOTION_AGORA_RTP_TIMEOUT_SECONDS    - inactivity timeout for upstream
+                                           replacement (default 20)
+  MAMMOTION_MIN_SESSION_LIFETIME_SECONDS - anti-flap minimum replacement age
+                                           unless definitely failed (default 30)
 """
 
 from __future__ import annotations
@@ -163,7 +172,13 @@ async def main() -> None:
     agora_rejoin_backoff = float(
         _env_int("MAMMOTION_AGORA_REJOIN_BACKOFF_SECONDS", 3)
     )
-    video_only = _env_bool("MAMMOTION_WEBRTC_VIDEO_ONLY", False)
+    video_only = _env_bool("VIDEO_ONLY", _env_bool("MAMMOTION_WEBRTC_VIDEO_ONLY", False))
+    keep_agora_session_alive = _env_bool("KEEP_AGORA_SESSION_ALIVE", False)
+    keepalive_seconds = float(_env_int("KEEPALIVE_SECONDS", 60))
+    rtp_timeout_seconds = float(_env_int("MAMMOTION_AGORA_RTP_TIMEOUT_SECONDS", 20))
+    min_session_lifetime_seconds = float(
+        _env_int("MAMMOTION_MIN_SESSION_LIFETIME_SECONDS", 30)
+    )
 
     LOGGER.info("Loading Mammotion SDK modules")
     from pymammotion.client import MammotionClient
@@ -295,6 +310,10 @@ async def main() -> None:
         publisher_wakeup=wake_publisher,
         reconnect_backoff_seconds=agora_rejoin_backoff,
         video_only=video_only,
+        keep_agora_session_alive=keep_agora_session_alive,
+        keepalive_seconds=keepalive_seconds,
+        rtp_timeout_seconds=rtp_timeout_seconds,
+        min_session_lifetime_seconds=min_session_lifetime_seconds,
     )
     runner = web.AppRunner(app)
     await runner.setup()
@@ -310,13 +329,18 @@ async def main() -> None:
     whep_source = f"webrtc:ws://{whep_host}:{whep_port}/api/ws?src={stream_name}"
     LOGGER.info(
         "WHEP server listening on %s:%s; go2rtc signaling=%s source=%s video_only=%s "
-        "agora_rejoin_backoff=%.1fs",
+        "agora_rejoin_backoff=%.1fs keep_agora_session_alive=%s keepalive=%.1fs "
+        "rtp_timeout=%.1fs min_lifetime=%.1fs",
         whep_bind,
         whep_port,
         go2rtc_signaling,
         whep_source,
         video_only,
         agora_rejoin_backoff,
+        keep_agora_session_alive,
+        keepalive_seconds,
+        rtp_timeout_seconds,
+        min_session_lifetime_seconds,
     )
 
     registrar: Go2RTCStreamRegistrar | None = None

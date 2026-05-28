@@ -25,6 +25,7 @@ the ``codec=`` arguments below and the "Port notes" in
 from __future__ import annotations
 
 import asyncio
+import copy
 import contextlib
 import hashlib
 import json
@@ -592,7 +593,8 @@ class AgoraWebSocketHandler:
         declare_remote_video_ssrc: bool = False,
         disable_audio_answer: bool = False,
         pion_compat: bool = False,
-        on_connection_lost: Callable[[], None] | None = None,
+        on_connection_lost: Callable[[str], None] | None = None,
+        on_media_activity: Callable[[], None] | None = None,
         video_codec: str = DEFAULT_VIDEO_CODEC,
     ) -> None:
         """Initialize runtime state."""
@@ -601,6 +603,7 @@ class AgoraWebSocketHandler:
         self._message_handlers: dict[str, Callable[[dict[str, Any]], Any]] = {}
         self._disconnect_task: asyncio.Task[None] | None = None
         self._on_connection_lost = on_connection_lost
+        self._on_media_activity = on_media_activity
         self._stream_name = ""
         self._session_id = ""
         self._device_id = ""
@@ -619,6 +622,7 @@ class AgoraWebSocketHandler:
         self._answer_sdp: str | None = None
         self._pending_answer_ortc: dict[str, Any] | None = None
         self._pending_offer_info: OfferSdpInfo | None = None
+        self._active_answer_ortc: dict[str, Any] | None = None
         self._rtc_token: str | None = None
         self._rtc_token_provider = rtc_token_provider
         self._prefer_instant_video = prefer_instant_video
@@ -890,7 +894,7 @@ class AgoraWebSocketHandler:
             raise
         except WebSocketException as err:
             LOGGER.warning("Agora message loop closed %s: %s", self._log_context(), err)
-            self._fire_connection_lost()
+            self._fire_connection_lost("websocket_closed")
         except Exception as err:  # noqa: BLE001
             LOGGER.warning(
                 "Agora message loop encountered unexpected %s %s: %s",
@@ -899,7 +903,7 @@ class AgoraWebSocketHandler:
                 err,
                 exc_info=True,
             )
-            self._fire_connection_lost()
+            self._fire_connection_lost("message_loop_error")
         finally:
             self._connection_state = "DISCONNECTED"
 
@@ -1034,7 +1038,7 @@ class AgoraWebSocketHandler:
             response.get("error_str"),
         )
         self._disconnect_task = asyncio.create_task(self.disconnect())
-        self._fire_connection_lost()
+        self._fire_connection_lost("p2p_lost")
 
     async def _handle_error(self, response: dict[str, Any]) -> None:
         """Handle generic Agora signaling errors."""
@@ -1081,6 +1085,8 @@ class AgoraWebSocketHandler:
             "cname": cname,
             "pt": publisher_pt if isinstance(publisher_pt, int) else None,
         }
+        if self._on_media_activity is not None:
+            self._on_media_activity()
 
         if isinstance(ssrc_id, int):
             await self._subscribe_video_stream(uid=uid, ssrc_id=ssrc_id)
@@ -1104,6 +1110,7 @@ class AgoraWebSocketHandler:
         if answer_sdp:
             self._joined = True
             self._answer_sdp = answer_sdp
+            self._active_answer_ortc = copy.deepcopy(self._pending_answer_ortc)
             self._pending_answer_ortc = None
             self._pending_offer_info = None
             # TEMP diagnostic: full answer SDP so we can verify candidates /
@@ -1899,11 +1906,39 @@ class AgoraWebSocketHandler:
         """Return websocket connectivity state."""
         return self._connection_state == "CONNECTED"
 
-    def _fire_connection_lost(self) -> None:
+    def build_answer_for_offer(
+        self,
+        offer_sdp: str,
+        *,
+        pion_compat: bool | None = None,
+    ) -> str | None:
+        """Generate a fresh SDP answer for a new downstream offer."""
+        offer_info = self._parse_offer_sdp(offer_sdp)
+        if offer_info is None:
+            return None
+        ortc = self._active_answer_ortc or self._pending_answer_ortc
+        if ortc is None:
+            return self._answer_sdp
+        if self._active_answer_ortc is None:
+            LOGGER.debug("Generating answer from pending ORTC state %s", self._log_context())
+
+        previous_pion_compat = self._pion_compat
+        if pion_compat is not None:
+            self._pion_compat = pion_compat
+        try:
+            answer_sdp = self._generate_answer_sdp(ortc, offer_info)
+        finally:
+            self._pion_compat = previous_pion_compat
+        if answer_sdp:
+            self._answer_sdp = answer_sdp
+        return answer_sdp
+
+    def _fire_connection_lost(self, reason: str) -> None:
         """Notify the owner that the Agora connection dropped unexpectedly."""
-        if self._on_connection_lost is not None:
-            self._on_connection_lost()
-            self._on_connection_lost = None
+        callback = self._on_connection_lost
+        self._on_connection_lost = None
+        if callback is not None:
+            callback(reason)
 
     async def disconnect(self) -> None:
         """Close websocket and cancel background tasks."""
@@ -1941,6 +1976,7 @@ class AgoraWebSocketHandler:
         self._answer_sdp = None
         self._pending_answer_ortc = None
         self._pending_offer_info = None
+        self._active_answer_ortc = None
         self._connection_state = "DISCONNECTED"
         self._video_streams.clear()
         self._subscribed_video_streams.clear()
