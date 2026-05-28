@@ -20,6 +20,8 @@ services:
       BRIDGE_SCRIPT: "mammotion_webrtc_bridge.py"
       MAMMOTION_EMAIL: "your@email.com"
       MAMMOTION_PASSWORD: "your-password"
+      # go2rtc REST API (Frigate's bundled go2rtc by default):
+      GO2RTC_API_URL: "http://frigate:1984"
       # Distinct name so it coexists with your existing `mammotion` RTSP stream:
       MAMMOTION_STREAM_NAME: "mammotion_webrtc"
       # Legacy var name retained for compatibility; defines the host go2rtc
