@@ -217,10 +217,11 @@ class MammotionWhepManager:
     async def _handle_join_failure(
         self,
         stream: str,
-        agora_handler: AgoraWebSocketHandler,
+        agora_handler: AgoraWebSocketHandler | None,
     ) -> None:
         """Tear down failed local join state and apply reconnect backoff."""
-        await agora_handler.disconnect()
+        if agora_handler is not None:
+            await agora_handler.disconnect()
         self._set_reconnect_backoff(stream)
 
     async def create_session(
@@ -297,37 +298,39 @@ class MammotionWhepManager:
                         )
                     )
 
-            agora_handler = AgoraWebSocketHandler(
-                rtc_token_provider=refresh_rtc_token,
-                prefer_instant_video=True,
-                subscribe_retry_delay=1.0,
-                subscribe_retry_attempts=3,
-                declare_remote_video_ssrc=True,
-                disable_audio_answer=self._video_only,
-                pion_compat=pion_compat,
-                on_connection_lost=_on_connection_lost,
-                # video_codec defaults to h265 (Mammotion).
-            )
-            agora_handler.set_log_context(
-                stream=stream,
-                session_id=session_id,
-                channel=credentials.channel,
-                device_id=credentials.device_id,
-            )
+            def _build_agora_handler() -> AgoraWebSocketHandler:
+                agora_handler = AgoraWebSocketHandler(
+                    rtc_token_provider=refresh_rtc_token,
+                    prefer_instant_video=True,
+                    subscribe_retry_delay=1.0,
+                    subscribe_retry_attempts=3,
+                    declare_remote_video_ssrc=True,
+                    disable_audio_answer=self._video_only,
+                    pion_compat=pion_compat,
+                    on_connection_lost=_on_connection_lost,
+                    # video_codec defaults to h265 (Mammotion).
+                )
+                agora_handler.set_log_context(
+                    stream=stream,
+                    session_id=session_id,
+                    channel=credentials.channel,
+                    device_id=credentials.device_id,
+                )
 
-            # Collect inline ICE candidates from the offer (PetKit did this in the
-            # manager before join_v3).
-            for line in offer_sdp.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("a=candidate:"):
-                    agora_handler.add_ice_candidate(
-                        RTCIceCandidateInit(candidate=stripped.removeprefix("a="))
-                    )
+                # Collect inline ICE candidates from the offer (PetKit did this in the
+                # manager before join_v3).
+                for line in offer_sdp.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("a=candidate:"):
+                        agora_handler.add_ice_candidate(
+                            RTCIceCandidateInit(candidate=stripped.removeprefix("a="))
+                        )
 
-            agora_handler.candidates = filter_agora_candidates(
-                agora_handler.candidates,
-                agora_response,
-            )
+                agora_handler.candidates = filter_agora_candidates(
+                    agora_handler.candidates,
+                    agora_response,
+                )
+                return agora_handler
 
             # NOTE(mammotion): PetKit started RTM (start_live + heartbeat) here. We
             # intentionally skip it. See DESIGN-webrtc-passthrough.md "Port notes".
@@ -341,7 +344,10 @@ class MammotionWhepManager:
                     credentials.device_id,
                 ),
             )
+            agora_handler: AgoraWebSocketHandler | None = None
+            answer_sdp: str | None = None
             for attempt in range(MAX_JOIN_ATTEMPTS):
+                agora_handler = _build_agora_handler()
                 try:
                     answer_sdp = await agora_handler.connect_and_join(
                         live_feed=credentials.to_agora_credentials(),
@@ -363,7 +369,7 @@ class MammotionWhepManager:
                         ),
                         attempt + 1,
                     )
-                    if attempt > 0:
+                    if attempt + 1 >= MAX_JOIN_ATTEMPTS:
                         raise RuntimeError(
                             "Agora duplicate join persisted after retry: "
                             + self._session_log_context(
@@ -381,7 +387,7 @@ class MammotionWhepManager:
                     await self._handle_join_failure(stream, agora_handler)
                     raise
 
-            if not answer_sdp:
+            if agora_handler is None or not answer_sdp:
                 await self._handle_join_failure(stream, agora_handler)
                 raise RuntimeError(
                     "Agora upstream negotiation did not return an SDP answer"

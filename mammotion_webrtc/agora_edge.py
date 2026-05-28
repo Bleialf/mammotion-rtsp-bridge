@@ -897,6 +897,7 @@ class AgoraWebSocketHandler:
                 type(err).__name__,
                 self._log_context(),
                 err,
+                exc_info=True,
             )
             self._fire_connection_lost()
         finally:
