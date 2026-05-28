@@ -28,6 +28,8 @@ Environment variables:
   MAMMOTION_WHEP_TOKEN                   - optional static bearer token
   GO2RTC_API_URL                         - go2rtc REST base (default http://frigate:1984)
   MAMMOTION_STREAM_NAME                  - go2rtc stream name (default mammotion)
+    MAMMOTION_GO2RTC_RECONCILE_SECONDS     - periodic re-register interval
+                                                                                     (default 20)
   MAMMOTION_KEEPALIVE_SECONDS            - MQTT keep-alive interval (default 10)
   MAMMOTION_RECONNECT_BACKOFF_SECONDS    - login retry backoff (default 8)
 """
@@ -147,6 +149,7 @@ async def main() -> None:
     go2rtc_api_url = os.getenv("GO2RTC_API_URL", "http://frigate:1984")
     stream_name = os.getenv("MAMMOTION_STREAM_NAME", "mammotion")
     go2rtc_signaling = (os.getenv("MAMMOTION_GO2RTC_SIGNALING", "http") or "http").strip().lower()
+    go2rtc_reconcile_interval = float(_env_int("MAMMOTION_GO2RTC_RECONCILE_SECONDS", 20))
     keepalive_interval = float(_env_int("MAMMOTION_KEEPALIVE_SECONDS", 10))
     reconnect_backoff = _env_int("MAMMOTION_RECONNECT_BACKOFF_SECONDS", 8)
 
@@ -340,8 +343,32 @@ async def main() -> None:
             # used an RTM heartbeat; Mammotion has none, so we use MQTT
             # send_todev_ble_sync(sync_type=2) instead.
             next_keepalive = loop.time()
+            next_go2rtc_reconcile = loop.time()
             while not stop_async.is_set():
                 now = loop.time()
+                if now >= next_go2rtc_reconcile:
+                    try:
+                        registrar = Go2RTCStreamRegistrar(go2rtc_api_url)
+                        async with registrar:
+                            ok = await registrar.ensure_stream(stream_name, whep_source)
+                        if ok:
+                            LOGGER.debug(
+                                "go2rtc stream %s registration is healthy", stream_name
+                            )
+                        else:
+                            LOGGER.warning(
+                                "go2rtc stream %s not confirmed; will retry in %.0fs",
+                                stream_name,
+                                go2rtc_reconcile_interval,
+                            )
+                    except Exception:
+                        LOGGER.warning(
+                            "go2rtc reconciliation failed; retrying in %.0fs",
+                            go2rtc_reconcile_interval,
+                            exc_info=True,
+                        )
+                    next_go2rtc_reconcile = now + go2rtc_reconcile_interval
+
                 if now >= next_keepalive:
                     try:
                         await mammotion.send_command_with_args(

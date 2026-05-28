@@ -33,6 +33,9 @@ services:
       # This path supports async trickle candidates and works around Pion/WHEP
       # interop issues seen with Agora edge.
       MAMMOTION_GO2RTC_SIGNALING: "ws"
+      # Reconcile go2rtc registration periodically so Frigate/go2rtc restarts
+      # do not leave the stream missing.
+      MAMMOTION_GO2RTC_RECONCILE_SECONDS: "20"
       MAMMOTION_KEEPALIVE_SECONDS: "10"
 
     # If this is a SEPARATE compose project from Frigate, attach to Frigate's
