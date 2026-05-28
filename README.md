@@ -74,11 +74,17 @@ Primary environment variables for WS passthrough:
 | `MAMMOTION_KEEPALIVE_SECONDS` | `10` | MQTT keepalive cadence |
 | `MAMMOTION_RECONNECT_BACKOFF_SECONDS` | `8` | Retry delay for cloud/session reconnect |
 | `MAMMOTION_AGORA_REJOIN_BACKOFF_SECONDS` | `3` | Short backoff before a new Agora join after failure/cleanup |
-| `MAMMOTION_WEBRTC_VIDEO_ONLY` | `false` | Answer audio m-lines as inactive for video-only debugging |
+| `VIDEO_ONLY` | `false` | Answer only video media (audio/backchannel disabled) |
+| `MAMMOTION_WEBRTC_VIDEO_ONLY` | `false` | Legacy alias for `VIDEO_ONLY` |
+| `KEEP_AGORA_SESSION_ALIVE` | `false` | Keep upstream Agora session across downstream reconnects |
+| `KEEPALIVE_SECONDS` | `60` | Keep upstream alive window after last downstream disconnect |
+| `MAMMOTION_AGORA_RTP_TIMEOUT_SECONDS` | `20` | Mark upstream unhealthy when media activity is stale |
+| `MAMMOTION_MIN_SESSION_LIFETIME_SECONDS` | `30` | Anti-flap minimum lifetime before non-definitive replacement |
 
 ## Reliability behavior
 
 - WS session lifecycle handles trickle ICE continuously (fixes open-once/reopen failures).
+- Repeated go2rtc offers now reuse healthy upstream Agora sessions instead of forcing replacement.
 - Periodic reconciliation re-registers stream after Frigate/go2rtc restarts.
 - Keepalive and wakeup logic keep the mower publishing on Agora.
 - Fresh login loop recovers from stale cloud sessions.
