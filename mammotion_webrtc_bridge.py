@@ -233,8 +233,40 @@ async def main() -> None:
                 raise
         return state["credentials"]
 
+    async def wake_publisher() -> None:
+        """Force the mower into the Agora channel with video on.
+
+        Fired at the start of each new WHEP session. ``send_todev_ble_sync``
+        with ``sync_type=3`` is Mammotion's BLE wake (mirrors mikey0000's HA
+        flow on offer open). ``device_agora_join_channel_with_position`` with
+        ``enter_state=1`` is ``vi_switch=1`` — explicit "join Agora channel,
+        video on". Both are best-effort; failures don't block negotiation.
+        """
+        mammotion = state["mammotion"]
+        device = state.get("device_name")
+        if mammotion is None or not device:
+            return
+        try:
+            await mammotion.send_command_with_args(
+                device, "send_todev_ble_sync", sync_type=3
+            )
+        except Exception:
+            LOGGER.debug("BLE sync wake-up failed", exc_info=True)
+        try:
+            await mammotion.send_command_with_args(
+                device,
+                "device_agora_join_channel_with_position",
+                enter_state=1,
+            )
+        except Exception:
+            LOGGER.debug("Force-join Agora channel failed", exc_info=True)
+
     # ---- Start the WHEP aiohttp server (long-lived) ----
-    app = create_whep_app(credentials_provider, auth_token=whep_token)
+    app = create_whep_app(
+        credentials_provider,
+        auth_token=whep_token,
+        publisher_wakeup=wake_publisher,
+    )
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, whep_bind, whep_port)

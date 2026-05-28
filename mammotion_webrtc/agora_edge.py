@@ -1394,13 +1394,10 @@ class AgoraWebSocketHandler:
 
     @staticmethod
     def _build_candidate_lines(candidates: list[dict[str, Any]]) -> list[str]:
-        """Translate Agora ICE candidates into SDP lines."""
+        """Translate Agora ICE candidates into SDP lines (mikey0000 format)."""
         candidate_lines: list[str] = []
         for index, candidate in enumerate(candidates):
-            # Numeric foundation: Agora sends the non-numeric "udpcandidate",
-            # which go2rtc/pion's ICE parser can reject. A numeric foundation is
-            # always safe.
-            foundation = str(index + 1)
+            foundation = candidate.get("foundation") or f"candidate{index}"
             protocol = candidate.get("protocol", "udp")
             priority = candidate.get("priority", 2103266323)
             ip = candidate.get("ip", "")
@@ -1411,12 +1408,9 @@ class AgoraWebSocketHandler:
                 "a=candidate:"
                 f"{foundation} 1 {protocol} {priority} {ip} {port} typ {candidate_type}"
             )
+            if candidate.get("generation") is not None:
+                line += f" generation {candidate['generation']}"
             candidate_lines.append(line)
-        # Signal that all candidates are present so the consumer (go2rtc) starts
-        # connectivity checks immediately rather than waiting for trickle. Its
-        # absence is why go2rtc never sent STUN -> Agora "channel stun timeout".
-        if candidate_lines:
-            candidate_lines.append("a=end-of-candidates")
         return candidate_lines
 
     @staticmethod
@@ -1498,13 +1492,20 @@ class AgoraWebSocketHandler:
             "a=rtcp:9 IN IP4 0.0.0.0",
             f"a=ice-ufrag:{ice_ufrag}",
             f"a=ice-pwd:{ice_pwd}",
+            "a=ice-options:trickle",
             f"a=fingerprint:{fingerprint}",
             "a=setup:active",
             f"a=mid:{mid}",
         ]
 
-    @staticmethod
+    # MID is excluded: Agora's edge hardcodes mid=2 for video internally, but
+    # the offer has video at mid=1 — if MID extension is negotiated the browser
+    # discards all video RTP due to MID mismatch (see mikey0000's PR #392).
+    _SKIP_EXT_URIS = frozenset({"urn:ietf:params:rtp-hdrext:sdes:mid"})
+
+    @classmethod
     def _build_extension_lines(
+        cls,
         offer_extensions: list[dict[str, Any]],
         answer_extensions: list[dict[str, Any]],
     ) -> list[str]:
@@ -1517,6 +1518,7 @@ class AgoraWebSocketHandler:
             f"a=extmap:{offer_ext_map[extension_name]} {extension_name}"
             for extension in answer_extensions
             if (extension_name := extension.get("extensionName")) in offer_ext_map
+            and extension_name not in cls._SKIP_EXT_URIS
         ]
 
     @staticmethod
