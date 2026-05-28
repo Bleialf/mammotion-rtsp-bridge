@@ -162,7 +162,13 @@ class MammotionWhepManager:
         self._lock = asyncio.Lock()
         self._sessions: dict[str, AgoraUpstreamSession] = {}
 
-    async def create_session(self, stream: str, offer_sdp: str) -> tuple[str, str]:
+    async def create_session(
+        self,
+        stream: str,
+        offer_sdp: str,
+        *,
+        pion_compat: bool = False,
+    ) -> tuple[str, str]:
         """Create or replace the Agora session for one stream."""
         # TEMP diagnostic: log go2rtc's offer so we can see its DTLS setup role
         # and offered codecs vs. the answer we build.
@@ -210,6 +216,7 @@ class MammotionWhepManager:
             subscribe_retry_delay=1.0,
             subscribe_retry_attempts=3,
             declare_remote_video_ssrc=True,
+            pion_compat=pion_compat,
             # Audio is answered with the natural sendonly direction, even
             # though Agora doesn't publish audio for Mammotion mowers. With
             # disable_audio_answer=True we emit a=inactive on mid=1, and on
@@ -398,9 +405,16 @@ async def _handle_whep_post(request: web.Request) -> web.Response:
     if not offer_sdp or not offer_sdp.strip():
         return web.Response(status=400, text="Empty SDP offer")
 
+    user_agent = request.headers.get("User-Agent", "")
+    pion_compat = "Go-http-client" in user_agent or "go2rtc" in user_agent.lower()
+
     manager = request.app[_MANAGER_KEY]
     try:
-        session_id, answer_sdp = await manager.create_session(stream, offer_sdp)
+        session_id, answer_sdp = await manager.create_session(
+            stream,
+            offer_sdp,
+            pion_compat=pion_compat,
+        )
     except (OSError, RuntimeError, ValueError, aiohttp.ClientError) as err:
         LOGGER.error("WHEP negotiation failed for %s: %s", stream, err)
         return web.Response(status=502, text=str(err))

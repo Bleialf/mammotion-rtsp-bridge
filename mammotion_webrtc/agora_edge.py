@@ -582,6 +582,7 @@ class AgoraWebSocketHandler:
         subscribe_retry_attempts: int = 0,
         declare_remote_video_ssrc: bool = False,
         disable_audio_answer: bool = False,
+        pion_compat: bool = False,
         on_connection_lost: Callable[[], None] | None = None,
         video_codec: str = DEFAULT_VIDEO_CODEC,
     ) -> None:
@@ -612,6 +613,7 @@ class AgoraWebSocketHandler:
         self._subscribe_retry_attempts = subscribe_retry_attempts
         self._declare_remote_video_ssrc = declare_remote_video_ssrc
         self._disable_audio_answer = disable_audio_answer
+        self._pion_compat = pion_compat
         # Mammotion publishes H.265 (see DEFAULT_VIDEO_CODEC). PetKit hardcoded
         # "h264" inline; here it is configurable but defaults to h265.
         self._video_codec = video_codec
@@ -1449,8 +1451,7 @@ class AgoraWebSocketHandler:
         fingerprint_value = primary.get("fingerprint", "")
         return f"{algorithm} {fingerprint_value}" if fingerprint_value else ""
 
-    @staticmethod
-    def _build_candidate_lines(candidates: list[dict[str, Any]]) -> list[str]:
+    def _build_candidate_lines(self, candidates: list[dict[str, Any]]) -> list[str]:
         """Translate Agora ICE candidates into SDP lines.
 
         Agora's ORTC payload reports ``foundation="udpcandidate"`` (string).
@@ -1470,7 +1471,12 @@ class AgoraWebSocketHandler:
                 # have no IPv6 route, and an unreachable candidate in front of
                 # the working IPv4 one delays ICE for the worse.
                 continue
-            foundation = candidate.get("foundation") or f"candidate{index}"
+            if self._pion_compat:
+                # Pion is stricter than browser libwebrtc with non-numeric
+                # foundations seen in Agora ORTC payloads.
+                foundation = str(index + 1)
+            else:
+                foundation = candidate.get("foundation") or f"candidate{index}"
             protocol = candidate.get("protocol", "udp")
             priority = candidate.get("priority", 2103266323)
             port = candidate.get("port", 0)
@@ -1549,8 +1555,8 @@ class AgoraWebSocketHandler:
             return payload_types
         return str(media.get("payloads", "")).split()
 
-    @staticmethod
     def _build_transport_lines(
+        self,
         media_type: str,
         payloads: str,
         *,
@@ -1566,7 +1572,7 @@ class AgoraWebSocketHandler:
             "a=rtcp:9 IN IP4 0.0.0.0",
             f"a=ice-ufrag:{ice_ufrag}",
             f"a=ice-pwd:{ice_pwd}",
-            "a=ice-options:trickle",
+            *([] if self._pion_compat else ["a=ice-options:trickle"]),
             f"a=fingerprint:{fingerprint}",
             "a=setup:active",
             f"a=mid:{mid}",
