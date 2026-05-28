@@ -210,7 +210,12 @@ class MammotionWhepManager:
             subscribe_retry_delay=1.0,
             subscribe_retry_attempts=3,
             declare_remote_video_ssrc=True,
-            disable_audio_answer=True,
+            # Audio is answered with the natural sendonly direction, even
+            # though Agora doesn't publish audio for Mammotion mowers. With
+            # disable_audio_answer=True we emit a=inactive on mid=1, and on
+            # BUNDLE Pion gets confused: it never starts ICE checks, Agora
+            # times out (p2p_lost). mikey0000's working HA impl never sets
+            # audio to inactive.
             on_connection_lost=_on_connection_lost,
             # video_codec defaults to h265 (Mammotion).
         )

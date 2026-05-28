@@ -1394,13 +1394,24 @@ class AgoraWebSocketHandler:
 
     @staticmethod
     def _build_candidate_lines(candidates: list[dict[str, Any]]) -> list[str]:
-        """Translate Agora ICE candidates into SDP lines (mikey0000 format)."""
+        """Translate Agora ICE candidates into SDP lines.
+
+        Agora's ORTC payload reports ``foundation="udpcandidate"`` (string).
+        libwebrtc (mikey0000's HA case) accepts that; Pion in go2rtc accepts it
+        too per RFC 5245 but only IPv4 is reachable from a typical Docker
+        bridge network, so we drop IPv6 host candidates.
+        """
         candidate_lines: list[str] = []
         for index, candidate in enumerate(candidates):
+            ip = str(candidate.get("ip", ""))
+            if not ip or ":" in ip:
+                # Skip empty + IPv6 host candidates — Docker bridges typically
+                # have no IPv6 route, and an unreachable candidate in front of
+                # the working IPv4 one delays ICE for the worse.
+                continue
             foundation = candidate.get("foundation") or f"candidate{index}"
             protocol = candidate.get("protocol", "udp")
             priority = candidate.get("priority", 2103266323)
-            ip = candidate.get("ip", "")
             port = candidate.get("port", 0)
             candidate_type = candidate.get("type", "host")
 
