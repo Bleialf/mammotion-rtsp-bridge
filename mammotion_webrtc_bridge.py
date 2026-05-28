@@ -146,6 +146,7 @@ async def main() -> None:
     whep_token = os.getenv("MAMMOTION_WHEP_TOKEN") or None
     go2rtc_api_url = os.getenv("GO2RTC_API_URL", "http://frigate:1984")
     stream_name = os.getenv("MAMMOTION_STREAM_NAME", "mammotion")
+    go2rtc_signaling = (os.getenv("MAMMOTION_GO2RTC_SIGNALING", "http") or "http").strip().lower()
     keepalive_interval = float(_env_int("MAMMOTION_KEEPALIVE_SECONDS", 10))
     reconnect_backoff = _env_int("MAMMOTION_RECONNECT_BACKOFF_SECONDS", 8)
 
@@ -271,11 +272,15 @@ async def main() -> None:
     await runner.setup()
     site = web.TCPSite(runner, whep_bind, whep_port)
     await site.start()
-    whep_source = f"webrtc:http://{whep_host}:{whep_port}/whep/{stream_name}"
+    if go2rtc_signaling == "ws":
+        whep_source = f"webrtc:ws://{whep_host}:{whep_port}/api/ws?src={stream_name}"
+    else:
+        whep_source = f"webrtc:http://{whep_host}:{whep_port}/whep/{stream_name}"
     LOGGER.info(
-        "WHEP server listening on %s:%s; go2rtc source = %s",
+        "WHEP server listening on %s:%s; go2rtc signaling=%s source=%s",
         whep_bind,
         whep_port,
+        go2rtc_signaling,
         whep_source,
     )
 

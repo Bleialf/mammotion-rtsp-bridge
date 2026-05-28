@@ -29,6 +29,10 @@ services:
       # container's network name:
       MAMMOTION_WHEP_HOST: "mammotion-webrtc"
       MAMMOTION_WHEP_PORT: "8555"
+      # Use go2rtc-native WS signaling instead of one-shot WHEP client.
+      # This path supports async trickle candidates and works around Pion/WHEP
+      # interop issues seen with Agora edge.
+      MAMMOTION_GO2RTC_SIGNALING: "ws"
       MAMMOTION_KEEPALIVE_SECONDS: "10"
 
     # If this is a SEPARATE compose project from Frigate, attach to Frigate's

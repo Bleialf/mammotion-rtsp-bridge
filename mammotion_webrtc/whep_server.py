@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import secrets
 from collections.abc import Awaitable, Callable
@@ -463,6 +464,108 @@ async def _handle_whep_delete(request: web.Request) -> web.Response:
     return web.Response(status=200, text="Session closed")
 
 
+async def _handle_go2rtc_ws(request: web.Request) -> web.StreamResponse:
+    """go2rtc-compatible `/api/ws` endpoint for `webrtc:ws://.../api/ws?src=...`.
+
+    The go2rtc WS client sends `webrtc/offer` first and trickles
+    `webrtc/candidate` messages asynchronously. Our Agora join flow needs the
+    candidate list up front, so we briefly buffer trickled candidates before
+    generating the answer.
+    """
+    auth_error = _check_auth(request)
+    if auth_error is not None:
+        return auth_error
+
+    stream = (request.query.get("src") or "").strip()
+    if not stream:
+        return web.Response(status=400, text="Missing ?src=...")
+
+    ws = web.WebSocketResponse(heartbeat=20.0)
+    await ws.prepare(request)
+
+    manager = request.app[_MANAGER_KEY]
+    session_open = False
+
+    try:
+        async for msg in ws:
+            if msg.type != web.WSMsgType.TEXT:
+                continue
+
+            try:
+                payload = json.loads(msg.data)
+            except json.JSONDecodeError:
+                continue
+
+            msg_type = str(payload.get("type") or "")
+            if msg_type != "webrtc/offer":
+                # Ignore other message types until we have completed offer/answer.
+                continue
+
+            offer_sdp = str(payload.get("value") or "")
+            if not offer_sdp.strip():
+                await ws.send_json(
+                    {
+                        "type": "error",
+                        "value": "webrtc/offer: empty SDP",
+                    }
+                )
+                continue
+
+            # Buffer trickled candidates for a short window before answering.
+            # go2rtc's WS client uses async candidates, unlike its WHEP client.
+            trickle_lines: list[str] = []
+            gather_deadline = asyncio.get_running_loop().time() + 0.45
+            while True:
+                remaining = gather_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    early = await asyncio.wait_for(ws.receive(), timeout=remaining)
+                except TimeoutError:
+                    break
+
+                if early.type != web.WSMsgType.TEXT:
+                    if early.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSED):
+                        break
+                    continue
+
+                try:
+                    early_payload = json.loads(early.data)
+                except json.JSONDecodeError:
+                    continue
+
+                if str(early_payload.get("type") or "") != "webrtc/candidate":
+                    continue
+
+                candidate = str(early_payload.get("value") or "").strip()
+                if not candidate:
+                    continue
+                if not candidate.startswith("candidate:"):
+                    continue
+                trickle_lines.append(f"a={candidate}")
+
+            if trickle_lines:
+                offer_sdp = offer_sdp.rstrip() + "\r\n" + "\r\n".join(trickle_lines) + "\r\n"
+
+            try:
+                session_id, answer_sdp = await manager.create_session(
+                    stream,
+                    offer_sdp,
+                    pion_compat=True,
+                )
+                session_open = True
+                await ws.send_json({"type": "webrtc/answer", "value": answer_sdp})
+                LOGGER.info("go2rtc WS session established stream=%s id=%s", stream, session_id)
+            except Exception as err:  # noqa: BLE001
+                LOGGER.error("go2rtc WS negotiation failed for %s: %s", stream, err)
+                await ws.send_json({"type": "error", "value": f"webrtc/offer: {err}"})
+    finally:
+        if session_open:
+            await manager.close_session(stream)
+
+    return ws
+
+
 def create_whep_app(
     credentials_provider: StreamCredentialsProvider,
     *,
@@ -487,6 +590,7 @@ def create_whep_app(
     app.router.add_post("/whep/{stream}", _handle_whep_post)
     app.router.add_patch("/whep/{stream}/{session_id}", _handle_whep_patch)
     app.router.add_delete("/whep/{stream}/{session_id}", _handle_whep_delete)
+    app.router.add_get("/api/ws", _handle_go2rtc_ws)
 
     async def _on_cleanup(_app: web.Application) -> None:
         await manager.close_all()
