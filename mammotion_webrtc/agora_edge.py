@@ -983,21 +983,24 @@ class AgoraWebSocketHandler:
         ssrc_id = message.get("ssrcId")
         rtx_ssrc_id = message.get("rtxSsrcId")
         cname = message.get("cname")
+        publisher_pt = message.get("pt")
         is_video = bool(message.get("video"))
 
         if not isinstance(uid, int) or not is_video:
             return None
 
-        LOGGER.debug(
-            "Agora on_add_video_stream: uid=%s ssrc=%s rtx_ssrc=%s",
+        LOGGER.info(
+            "Agora on_add_video_stream: uid=%s ssrc=%s rtx_ssrc=%s pt=%s",
             uid,
             ssrc_id,
             rtx_ssrc_id,
+            publisher_pt,
         )
         self._video_streams[uid] = {
             "ssrcId": ssrc_id,
             "rtxSsrcId": rtx_ssrc_id,
             "cname": cname,
+            "pt": publisher_pt if isinstance(publisher_pt, int) else None,
         }
 
         if isinstance(ssrc_id, int):
@@ -1682,6 +1685,19 @@ class AgoraWebSocketHandler:
             if media_type == "audio"
             else caps.get("videoCodecs", []) or []
         )
+        # For the video section: when the publisher's actual payload type is
+        # known (from on_add_video_stream `pt`), narrow the answer to just that
+        # PT. The Mammotion publisher only sends one codec at a time (H.265 on
+        # PT 100). go2rtc otherwise sees H264 + H265 in our answer and picks
+        # the first match (H264), then never receives matching RTP because the
+        # publisher is on H265 — symptom: probe shows an h264 receiver, no
+        # video reaches the consumer, Agora eventually p2p_lost.
+        if media_type == "video" and primary_video_stream is not None:
+            publisher_pt = primary_video_stream.get("pt")
+            if isinstance(publisher_pt, int):
+                matching = [c for c in codecs if c.get("payloadType") == publisher_pt]
+                if matching:
+                    codecs = matching
         answer_extensions = (
             caps.get("audioExtensions", []) or []
             if media_type == "audio"
