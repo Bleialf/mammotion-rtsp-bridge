@@ -48,6 +48,7 @@ LOGGER = logging.getLogger(__name__)
 # subscribe calls (agora_websocket.py ~553, ~642, ~679 / join_v3 codec).
 # Changed here; the SDP builders themselves stay codec-agnostic.
 DEFAULT_VIDEO_CODEC = "h265"
+ERR_REPEAT_JOIN = "ERR_REPEAT_JOIN"
 
 
 class AgoraJoinError(RuntimeError):
@@ -826,9 +827,14 @@ class AgoraWebSocketHandler:
                             return answer
                     elif response.get("_result") == "failure":
                         error_message = response.get("_message")
+                        if error_message not in (None, ""):
+                            join_error = str(error_message)
+                        elif response:
+                            join_error = str(response)
+                        else:
+                            join_error = "join failed"
                         raise AgoraJoinError(
-                            str(error_message if error_message not in (None, "") else response)
-                            or "join failed"
+                            join_error
                         )
 
         except TimeoutError:
@@ -1034,7 +1040,7 @@ class AgoraWebSocketHandler:
         message = response.get("_message", {})
         error_text = str(message.get("error", message))
         LOGGER.error("Agora error %s: %s", self._log_context(), error_text)
-        if "ERR_REPEAT_JOIN" in error_text:
+        if ERR_REPEAT_JOIN in error_text:
             raise AgoraDuplicateJoinError(error_text)
 
     async def _handle_rtp_capability_change(self, response: dict[str, Any]) -> None:

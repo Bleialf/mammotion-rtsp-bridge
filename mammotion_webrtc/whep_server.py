@@ -58,6 +58,7 @@ LOGGER = logging.getLogger(__name__)
 # the RTC token renewal (renew_token is triggered by Agora's expiry events, but
 # this provides a proactive backstop).
 TOKEN_REFRESH_INTERVAL_SECONDS = 20 * 60
+MAX_JOIN_ATTEMPTS = 2
 
 
 @dataclass
@@ -73,7 +74,7 @@ class StreamCredentials:
     channel: str
     rtc_token: str
     uid: int
-    # Mammotion device/iot id for lifecycle logging and duplicate-session traces.
+    # Mammotion device/IoT ID for lifecycle logging and duplicate-session traces.
     device_id: str = ""
     # "CN,GLOBAL"-style area code string accepted by choose_server. Defaults to
     # global; the entrypoint maps Mammotion's areaCode if it can.
@@ -340,7 +341,7 @@ class MammotionWhepManager:
                     credentials.device_id,
                 ),
             )
-            for attempt in range(2):
+            for attempt in range(MAX_JOIN_ATTEMPTS):
                 try:
                     answer_sdp = await agora_handler.connect_and_join(
                         live_feed=credentials.to_agora_credentials(),
@@ -364,7 +365,7 @@ class MammotionWhepManager:
                     )
                     if attempt > 0:
                         raise RuntimeError(
-                            "Agora duplicate join persisted after retry "
+                            "Agora duplicate join persisted after retry: "
                             + self._session_log_context(
                                 stream,
                                 session_id,
