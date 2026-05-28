@@ -292,6 +292,23 @@ class MammotionWhepManager:
             LOGGER.debug("Collected %d trickle candidates for %s", added, stream)
         return True
 
+    async def add_session_candidate(
+        self,
+        stream: str,
+        session_id: str,
+        candidate: str,
+    ) -> bool:
+        """Forward one trickled ICE candidate for an active session."""
+        async with self._lock:
+            session = self._sessions.get(stream)
+        if session is None or session.session_id != session_id:
+            return False
+
+        session.agora_handler.add_ice_candidate(
+            RTCIceCandidateInit(candidate=candidate)
+        )
+        return True
+
     async def close_session(self, stream: str) -> bool:
         """Close the Agora session for one stream."""
         async with self._lock:
@@ -484,7 +501,8 @@ async def _handle_go2rtc_ws(request: web.Request) -> web.StreamResponse:
     await ws.prepare(request)
 
     manager = request.app[_MANAGER_KEY]
-    session_open = False
+    current_session_id: str | None = None
+    pending_candidates: list[str] = []
 
     try:
         async for msg in ws:
@@ -497,8 +515,22 @@ async def _handle_go2rtc_ws(request: web.Request) -> web.StreamResponse:
                 continue
 
             msg_type = str(payload.get("type") or "")
+            if msg_type == "webrtc/candidate":
+                candidate = str(payload.get("value") or "").strip()
+                if not candidate.startswith("candidate:"):
+                    continue
+
+                if current_session_id:
+                    await manager.add_session_candidate(
+                        stream,
+                        current_session_id,
+                        candidate,
+                    )
+                else:
+                    pending_candidates.append(candidate)
+                continue
+
             if msg_type != "webrtc/offer":
-                # Ignore other message types until we have completed offer/answer.
                 continue
 
             offer_sdp = str(payload.get("value") or "")
@@ -511,41 +543,10 @@ async def _handle_go2rtc_ws(request: web.Request) -> web.StreamResponse:
                 )
                 continue
 
-            # Buffer trickled candidates for a short window before answering.
-            # go2rtc's WS client uses async candidates, unlike its WHEP client.
-            trickle_lines: list[str] = []
-            gather_deadline = asyncio.get_running_loop().time() + 0.45
-            while True:
-                remaining = gather_deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    break
-                try:
-                    early = await asyncio.wait_for(ws.receive(), timeout=remaining)
-                except TimeoutError:
-                    break
-
-                if early.type != web.WSMsgType.TEXT:
-                    if early.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSED):
-                        break
-                    continue
-
-                try:
-                    early_payload = json.loads(early.data)
-                except json.JSONDecodeError:
-                    continue
-
-                if str(early_payload.get("type") or "") != "webrtc/candidate":
-                    continue
-
-                candidate = str(early_payload.get("value") or "").strip()
-                if not candidate:
-                    continue
-                if not candidate.startswith("candidate:"):
-                    continue
-                trickle_lines.append(f"a={candidate}")
-
-            if trickle_lines:
+            if pending_candidates:
+                trickle_lines = [f"a={candidate}" for candidate in pending_candidates]
                 offer_sdp = offer_sdp.rstrip() + "\r\n" + "\r\n".join(trickle_lines) + "\r\n"
+                pending_candidates.clear()
 
             try:
                 session_id, answer_sdp = await manager.create_session(
@@ -553,14 +554,14 @@ async def _handle_go2rtc_ws(request: web.Request) -> web.StreamResponse:
                     offer_sdp,
                     pion_compat=True,
                 )
-                session_open = True
+                current_session_id = session_id
                 await ws.send_json({"type": "webrtc/answer", "value": answer_sdp})
                 LOGGER.info("go2rtc WS session established stream=%s id=%s", stream, session_id)
             except Exception as err:  # noqa: BLE001
                 LOGGER.error("go2rtc WS negotiation failed for %s: %s", stream, err)
                 await ws.send_json({"type": "error", "value": f"webrtc/offer: {err}"})
     finally:
-        if session_open:
+        if current_session_id:
             await manager.close_session(stream)
 
     return ws
