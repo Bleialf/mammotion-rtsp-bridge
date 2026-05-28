@@ -1369,16 +1369,49 @@ class AgoraWebSocketHandler:
             LOGGER.error("Failed to parse offer SDP: %s", err)
             return None
 
-    @staticmethod
-    def _select_rtp_capabilities(ortc: dict[str, Any]) -> dict[str, Any]:
+    # Agora's media servers do not generate transport-cc feedback. The official
+    # Web SDK (AgoraRTC_N, mungMediaDesc) strips both the transport-wide-cc
+    # extmap and the per-payload `a=rtcp-fb:* transport-cc` lines before feeding
+    # the synthesized remote SDP into the browser PeerConnection. We mirror that
+    # munging in the answer SDP we hand to go2rtc/Pion — without it the consumer
+    # negotiates transport-cc, waits for feedback that never arrives, and ICE
+    # eventually times out (p2p_lost on Agora side).
+    _TWCC_URI = (
+        "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
+    )
+
+    @classmethod
+    def _strip_transport_cc(cls, capabilities: dict[str, Any]) -> dict[str, Any]:
+        """Return a copy of caps with transport-cc extension + rtcp-fb removed."""
+        munged = dict(capabilities)
+        for ext_key in ("audioExtensions", "videoExtensions"):
+            munged[ext_key] = [
+                ext for ext in (munged.get(ext_key) or [])
+                if ext.get("extensionName") != cls._TWCC_URI
+            ]
+        for codec_key in ("audioCodecs", "videoCodecs"):
+            new_codecs = []
+            for codec in (munged.get(codec_key) or []):
+                codec_copy = dict(codec)
+                codec_copy["rtcpFeedbacks"] = [
+                    fb for fb in (codec.get("rtcpFeedbacks") or [])
+                    if fb.get("type") != "transport-cc"
+                ]
+                new_codecs.append(codec_copy)
+            munged[codec_key] = new_codecs
+        return munged
+
+    @classmethod
+    def _select_rtp_capabilities(cls, ortc: dict[str, Any]) -> dict[str, Any]:
         """Return the preferred RTP capability block from Agora ORTC data."""
         rtp_capabilities = ortc.get("rtpCapabilities", {})
-        return (
+        caps = (
             rtp_capabilities.get("sendrecv")
             or rtp_capabilities.get("recv")
             or rtp_capabilities.get("send")
             or rtp_capabilities
         )
+        return cls._strip_transport_cc(caps)
 
     @staticmethod
     def _extract_fingerprint(dtls_parameters: dict[str, Any]) -> str:
