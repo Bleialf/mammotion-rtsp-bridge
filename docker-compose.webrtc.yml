@@ -17,24 +17,14 @@ services:
     #   dockerfile: Dockerfile
     restart: unless-stopped
     environment:
-      BRIDGE_SCRIPT: "mammotion_webrtc_bridge.py"   # selects the WebRTC entrypoint
+      BRIDGE_SCRIPT: "mammotion_webrtc_bridge.py"
       MAMMOTION_EMAIL: "your@email.com"
       MAMMOTION_PASSWORD: "your-password"
-      MAMMOTION_DEVICE_NAME: "first"
-      # go2rtc REST API (Frigate's bundled go2rtc) for stream registration:
-      GO2RTC_API_URL: "http://frigate:1984"
       # Distinct name so it coexists with your existing `mammotion` RTSP stream:
       MAMMOTION_STREAM_NAME: "mammotion_webrtc"
-      # Legacy var names retained for compatibility; these define the host/port
-      # go2rtc uses to dial the bridge WS endpoint.
+      # Legacy var name retained for compatibility; defines the host go2rtc
+      # uses to dial the bridge WS endpoint.
       MAMMOTION_WHEP_HOST: "mammotion-webrtc"
-      MAMMOTION_WHEP_PORT: "8555"
-      # WS signaling is the only supported mode.
-      MAMMOTION_GO2RTC_SIGNALING: "ws"
-      # Reconcile go2rtc registration periodically so Frigate/go2rtc restarts
-      # do not leave the stream missing.
-      MAMMOTION_GO2RTC_RECONCILE_SECONDS: "20"
-      MAMMOTION_KEEPALIVE_SECONDS: "10"
 
     # If this is a SEPARATE compose project from Frigate, attach to Frigate's
     # network (find it with `docker network ls`) so `frigate` resolves:
