@@ -73,6 +73,8 @@ Primary environment variables for WS passthrough:
 | `MAMMOTION_GO2RTC_RECONCILE_SECONDS` | `20` | Periodic go2rtc registration self-heal interval |
 | `MAMMOTION_KEEPALIVE_SECONDS` | `10` | MQTT keepalive cadence |
 | `MAMMOTION_RECONNECT_BACKOFF_SECONDS` | `8` | Retry delay for cloud/session reconnect |
+| `MAMMOTION_AGORA_REJOIN_BACKOFF_SECONDS` | `3` | Short backoff before a new Agora join after failure/cleanup |
+| `MAMMOTION_WEBRTC_VIDEO_ONLY` | `false` | Answer audio m-lines as inactive for video-only debugging |
 
 ## Reliability behavior
 

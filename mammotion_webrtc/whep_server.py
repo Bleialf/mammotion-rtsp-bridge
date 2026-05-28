@@ -45,6 +45,7 @@ from aiohttp import web
 from .agora_edge import (
     AgoraAPIClient,
     AgoraCredentials,
+    AgoraDuplicateJoinError,
     AgoraResponse,
     AgoraWebSocketHandler,
     RTCIceCandidateInit,
@@ -72,6 +73,7 @@ class StreamCredentials:
     channel: str
     rtc_token: str
     uid: int
+    device_id: str = ""
     # "CN,GLOBAL"-style area code string accepted by choose_server. Defaults to
     # global; the entrypoint maps Mammotion's areaCode if it can.
     area_code: str = "CN,GLOBAL"
@@ -138,7 +140,10 @@ async def refresh_agora_context(credentials: StreamCredentials) -> AgoraResponse
 class AgoraUpstreamSession:
     """One direct Agora session backing a WHEP consumer (go2rtc)."""
 
+    stream: str
     session_id: str
+    channel: str
+    device_id: str
     agora_handler: AgoraWebSocketHandler
     refresh_task: asyncio.Task[None] | None = None
 
@@ -156,12 +161,56 @@ class MammotionWhepManager:
         credentials_provider: StreamCredentialsProvider,
         *,
         publisher_wakeup: Callable[[], Awaitable[None]] | None = None,
+        reconnect_backoff_seconds: float = 3.0,
+        video_only: bool = False,
     ) -> None:
         """Store the credentials provider and per-stream session state."""
         self._credentials_provider = credentials_provider
         self._publisher_wakeup = publisher_wakeup
         self._lock = asyncio.Lock()
         self._sessions: dict[str, AgoraUpstreamSession] = {}
+        self._stream_locks: dict[str, asyncio.Lock] = {}
+        self._reconnect_backoff_seconds = reconnect_backoff_seconds
+        self._video_only = video_only
+        self._retry_after: dict[str, float] = {}
+
+    async def _get_stream_lock(self, stream: str) -> asyncio.Lock:
+        """Return the serialized lifecycle lock for one stream."""
+        async with self._lock:
+            return self._stream_locks.setdefault(stream, asyncio.Lock())
+
+    @staticmethod
+    def _session_log_context(
+        stream: str,
+        session_id: str = "",
+        channel: str = "",
+        device_id: str = "",
+    ) -> str:
+        """Build a consistent session log context string."""
+        parts = [f"stream={stream}"]
+        if device_id:
+            parts.append(f"device={device_id}")
+        if channel:
+            parts.append(f"channel={channel}")
+        if session_id:
+            parts.append(f"session={session_id}")
+        return " ".join(parts)
+
+    async def _wait_for_reconnect_backoff(self, stream: str) -> None:
+        """Sleep until the stream is allowed to join again."""
+        retry_at = self._retry_after.get(stream, 0.0)
+        now = asyncio.get_running_loop().time()
+        if retry_at <= now:
+            return
+        delay = retry_at - now
+        LOGGER.info("Reconnect backoff stream=%s delay=%.1fs", stream, delay)
+        await asyncio.sleep(delay)
+
+    def _set_reconnect_backoff(self, stream: str) -> None:
+        """Delay the next join attempt for one stream."""
+        self._retry_after[stream] = (
+            asyncio.get_running_loop().time() + self._reconnect_backoff_seconds
+        )
 
     async def create_session(
         self,
@@ -174,102 +223,174 @@ class MammotionWhepManager:
         # TEMP diagnostic: log go2rtc's offer so we can see its DTLS setup role
         # and offered codecs vs. the answer we build.
         LOGGER.info("go2rtc WHEP offer SDP:\n%s", offer_sdp)
-        await self.close_session(stream)
-
-        # Force the mower into the Agora channel with video on BEFORE we open
-        # the upstream WS. Mammotion's publisher otherwise idles when the only
-        # subscriber is go2rtc (no app viewer). Best-effort: never block negotiation.
-        if self._publisher_wakeup is not None:
-            try:
-                await self._publisher_wakeup()
-            except Exception:  # noqa: BLE001
-                LOGGER.exception("Publisher wakeup failed (continuing)")
-
-        credentials = await self._credentials_provider()
-        for field_name in ("app_id", "channel", "rtc_token"):
-            if not getattr(credentials, field_name, None):
-                raise RuntimeError(
-                    f"Stream credentials missing {field_name}; cannot start Agora"
+        stream_lock = await self._get_stream_lock(stream)
+        async with stream_lock:
+            existing = self._sessions.get(stream)
+            if existing is not None:
+                LOGGER.info(
+                    "Preventing duplicate join; cleaning existing session %s",
+                    self._session_log_context(
+                        stream,
+                        existing.session_id,
+                        existing.channel,
+                        existing.device_id,
+                    ),
                 )
-
-        agora_response = await refresh_agora_context(credentials)
-        if agora_response is None:
-            raise RuntimeError("Failed to retrieve Agora edge servers")
-
-        async def refresh_rtc_token() -> str | None:
-            # TODO(mammotion): unlike PetKit there is no RTM update_tokens step.
-            # We re-fetch the stream subscription to obtain a fresh rtc_token
-            # for Agora's renew_token. The provider must return a current token.
-            try:
-                refreshed = await self._credentials_provider()
-            except Exception:  # noqa: BLE001
-                return None
-            return refreshed.rtc_token or None
-
-        def _on_connection_lost() -> None:
-            # Schedule cleanup so a dropped Agora session frees go2rtc to redial.
-            with contextlib.suppress(RuntimeError):
-                asyncio.get_running_loop().create_task(self.close_session(stream))
-
-        agora_handler = AgoraWebSocketHandler(
-            rtc_token_provider=refresh_rtc_token,
-            prefer_instant_video=True,
-            subscribe_retry_delay=1.0,
-            subscribe_retry_attempts=3,
-            declare_remote_video_ssrc=True,
-            pion_compat=pion_compat,
-            # Audio is answered with the natural sendonly direction, even
-            # though Agora doesn't publish audio for Mammotion mowers. With
-            # disable_audio_answer=True we emit a=inactive on mid=1, and on
-            # BUNDLE Pion gets confused: it never starts ICE checks, Agora
-            # times out (p2p_lost). mikey0000's working HA impl never sets
-            # audio to inactive.
-            on_connection_lost=_on_connection_lost,
-            # video_codec defaults to h265 (Mammotion).
-        )
-
-        # Collect inline ICE candidates from the offer (PetKit did this in the
-        # manager before join_v3).
-        for line in offer_sdp.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("a=candidate:"):
-                agora_handler.add_ice_candidate(
-                    RTCIceCandidateInit(candidate=stripped.removeprefix("a="))
+                await self._close_session_locked(
+                    stream,
+                    reason="replaced by new offer",
                 )
+            await self._wait_for_reconnect_backoff(stream)
 
-        agora_handler.candidates = filter_agora_candidates(
-            agora_handler.candidates,
-            agora_response,
-        )
+            # Force the mower into the Agora channel with video on BEFORE we open
+            # the upstream WS. Mammotion's publisher otherwise idles when the only
+            # subscriber is go2rtc (no app viewer). Best-effort: never block negotiation.
+            if self._publisher_wakeup is not None:
+                try:
+                    await self._publisher_wakeup()
+                except Exception:  # noqa: BLE001
+                    LOGGER.exception("Publisher wakeup failed (continuing)")
 
-        # NOTE(mammotion): PetKit started RTM (start_live + heartbeat) here. We
-        # intentionally skip it. See DESIGN-webrtc-passthrough.md "Port notes".
+            credentials = await self._credentials_provider()
+            for field_name in ("app_id", "channel", "rtc_token"):
+                if not getattr(credentials, field_name, None):
+                    raise RuntimeError(
+                        f"Stream credentials missing {field_name}; cannot start Agora"
+                    )
 
-        session_id = secrets.token_hex(16)
-        try:
-            answer_sdp = await agora_handler.connect_and_join(
-                live_feed=credentials.to_agora_credentials(),
-                offer_sdp=offer_sdp,
-                session_id=session_id,
-                app_id=credentials.app_id,
-                agora_response=agora_response,
+            agora_response = await refresh_agora_context(credentials)
+            if agora_response is None:
+                raise RuntimeError("Failed to retrieve Agora edge servers")
+
+            async def refresh_rtc_token() -> str | None:
+                # TODO(mammotion): unlike PetKit there is no RTM update_tokens step.
+                # We re-fetch the stream subscription to obtain a fresh rtc_token
+                # for Agora's renew_token. The provider must return a current token.
+                try:
+                    refreshed = await self._credentials_provider()
+                except Exception:  # noqa: BLE001
+                    return None
+                return refreshed.rtc_token or None
+
+            session_id = secrets.token_hex(16)
+
+            def _on_connection_lost() -> None:
+                # Schedule cleanup so a dropped Agora session frees go2rtc to redial.
+                with contextlib.suppress(RuntimeError):
+                    asyncio.get_running_loop().create_task(
+                        self.close_session(
+                            stream,
+                            expected_session_id=session_id,
+                            reason="Agora connection lost",
+                        )
+                    )
+
+            agora_handler = AgoraWebSocketHandler(
+                rtc_token_provider=refresh_rtc_token,
+                prefer_instant_video=True,
+                subscribe_retry_delay=1.0,
+                subscribe_retry_attempts=3,
+                declare_remote_video_ssrc=True,
+                disable_audio_answer=self._video_only,
+                pion_compat=pion_compat,
+                on_connection_lost=_on_connection_lost,
+                # video_codec defaults to h265 (Mammotion).
             )
-        except Exception:
-            await agora_handler.disconnect()
-            raise
+            agora_handler.set_log_context(
+                stream=stream,
+                session_id=session_id,
+                channel=credentials.channel,
+                device_id=credentials.device_id,
+            )
 
-        if not answer_sdp:
-            await agora_handler.disconnect()
-            raise RuntimeError("Agora upstream negotiation did not return an SDP answer")
+            # Collect inline ICE candidates from the offer (PetKit did this in the
+            # manager before join_v3).
+            for line in offer_sdp.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("a=candidate:"):
+                    agora_handler.add_ice_candidate(
+                        RTCIceCandidateInit(candidate=stripped.removeprefix("a="))
+                    )
 
-        session = AgoraUpstreamSession(
-            session_id=session_id,
-            agora_handler=agora_handler,
-        )
-        async with self._lock:
-            self._sessions[stream] = session
+            agora_handler.candidates = filter_agora_candidates(
+                agora_handler.candidates,
+                agora_response,
+            )
 
-        return session_id, answer_sdp
+            # NOTE(mammotion): PetKit started RTM (start_live + heartbeat) here. We
+            # intentionally skip it. See DESIGN-webrtc-passthrough.md "Port notes".
+
+            LOGGER.info(
+                "Creating Agora session %s",
+                self._session_log_context(
+                    stream,
+                    session_id,
+                    credentials.channel,
+                    credentials.device_id,
+                ),
+            )
+            for attempt in range(2):
+                try:
+                    answer_sdp = await agora_handler.connect_and_join(
+                        live_feed=credentials.to_agora_credentials(),
+                        offer_sdp=offer_sdp,
+                        session_id=session_id,
+                        app_id=credentials.app_id,
+                        agora_response=agora_response,
+                    )
+                    break
+                except AgoraDuplicateJoinError:
+                    await agora_handler.disconnect()
+                    self._set_reconnect_backoff(stream)
+                    LOGGER.warning(
+                        "Agora duplicate join detected %s attempt=%d",
+                        self._session_log_context(
+                            stream,
+                            session_id,
+                            credentials.channel,
+                            credentials.device_id,
+                        ),
+                        attempt + 1,
+                    )
+                    if attempt:
+                        raise RuntimeError("Agora duplicate join persisted after retry")
+                    await self._wait_for_reconnect_backoff(stream)
+                    credentials = await self._credentials_provider()
+                    agora_response = await refresh_agora_context(credentials)
+                    continue
+                except Exception:
+                    await agora_handler.disconnect()
+                    self._set_reconnect_backoff(stream)
+                    raise
+
+            if not answer_sdp:
+                await agora_handler.disconnect()
+                self._set_reconnect_backoff(stream)
+                raise RuntimeError(
+                    "Agora upstream negotiation did not return an SDP answer"
+                )
+
+            session = AgoraUpstreamSession(
+                stream=stream,
+                session_id=session_id,
+                channel=credentials.channel,
+                device_id=credentials.device_id,
+                agora_handler=agora_handler,
+            )
+            async with self._lock:
+                self._sessions[stream] = session
+                self._retry_after[stream] = 0.0
+
+            LOGGER.info(
+                "Agora session active %s",
+                self._session_log_context(
+                    stream,
+                    session_id,
+                    credentials.channel,
+                    credentials.device_id,
+                ),
+            )
+            return session_id, answer_sdp
 
     async def add_session_candidates(
         self,
@@ -278,19 +399,30 @@ class MammotionWhepManager:
         sdp_fragment: str,
     ) -> bool:
         """Forward trickled ICE candidates for one active session."""
-        async with self._lock:
-            session = self._sessions.get(stream)
-        if session is None or session.session_id != session_id:
-            return False
+        stream_lock = await self._get_stream_lock(stream)
+        async with stream_lock:
+            async with self._lock:
+                session = self._sessions.get(stream)
+            if session is None or session.session_id != session_id:
+                return False
 
-        added = 0
-        for candidate in _parse_trickle_candidates(sdp_fragment):
-            session.agora_handler.add_ice_candidate(candidate)
-            added += 1
+            added = 0
+            for candidate in _parse_trickle_candidates(sdp_fragment):
+                session.agora_handler.add_ice_candidate(candidate)
+                added += 1
 
-        if added:
-            LOGGER.debug("Collected %d trickle candidates for %s", added, stream)
-        return True
+            if added:
+                LOGGER.debug(
+                    "Collected %d trickle candidates for %s",
+                    added,
+                    self._session_log_context(
+                        stream,
+                        session.session_id,
+                        session.channel,
+                        session.device_id,
+                    ),
+                )
+            return True
 
     async def add_session_candidate(
         self,
@@ -299,23 +431,50 @@ class MammotionWhepManager:
         candidate: str,
     ) -> bool:
         """Forward one trickled ICE candidate for an active session."""
+        stream_lock = await self._get_stream_lock(stream)
+        async with stream_lock:
+            async with self._lock:
+                session = self._sessions.get(stream)
+            if session is None or session.session_id != session_id:
+                return False
+
+            session.agora_handler.add_ice_candidate(
+                RTCIceCandidateInit(candidate=candidate)
+            )
+            return True
+
+    async def _close_session_locked(
+        self,
+        stream: str,
+        *,
+        expected_session_id: str | None = None,
+        reason: str,
+    ) -> bool:
+        """Close the Agora session for one stream while holding its lock."""
         async with self._lock:
             session = self._sessions.get(stream)
-        if session is None or session.session_id != session_id:
-            return False
-
-        session.agora_handler.add_ice_candidate(
-            RTCIceCandidateInit(candidate=candidate)
-        )
-        return True
-
-    async def close_session(self, stream: str) -> bool:
-        """Close the Agora session for one stream."""
-        async with self._lock:
-            session = self._sessions.pop(stream, None)
 
         if session is None:
             return False
+        if expected_session_id and session.session_id != expected_session_id:
+            LOGGER.info(
+                "Skipping stale cleanup stream=%s expected_session=%s active_session=%s",
+                stream,
+                expected_session_id,
+                session.session_id,
+            )
+            return False
+
+        LOGGER.info(
+            "Session cleanup start %s reason=%s",
+            self._session_log_context(
+                stream,
+                session.session_id,
+                session.channel,
+                session.device_id,
+            ),
+            reason,
+        )
 
         if session.refresh_task is not None:
             session.refresh_task.cancel()
@@ -323,14 +482,45 @@ class MammotionWhepManager:
                 await session.refresh_task
 
         await session.agora_handler.disconnect()
+
+        async with self._lock:
+            current = self._sessions.get(stream)
+            if current is session:
+                self._sessions.pop(stream, None)
+
+        LOGGER.info(
+            "Session cleanup complete %s",
+            self._session_log_context(
+                stream,
+                session.session_id,
+                session.channel,
+                session.device_id,
+            ),
+        )
         return True
+
+    async def close_session(
+        self,
+        stream: str,
+        *,
+        expected_session_id: str | None = None,
+        reason: str = "requested",
+    ) -> bool:
+        """Close the Agora session for one stream."""
+        stream_lock = await self._get_stream_lock(stream)
+        async with stream_lock:
+            return await self._close_session_locked(
+                stream,
+                expected_session_id=expected_session_id,
+                reason=reason,
+            )
 
     async def close_all(self) -> None:
         """Close all active sessions."""
         async with self._lock:
             streams = list(self._sessions)
         for stream in streams:
-            await self.close_session(stream)
+            await self.close_session(stream, reason="application shutdown")
 
 
 def _parse_trickle_candidates(sdp_fragment: str) -> list[RTCIceCandidateInit]:
@@ -474,9 +664,13 @@ async def _handle_whep_delete(request: web.Request) -> web.Response:
         return auth_error
 
     stream = request.match_info["stream"]
-    # session_id is part of the route but close is keyed by stream.
+    session_id = request.match_info["session_id"]
     manager = request.app[_MANAGER_KEY]
-    if not await manager.close_session(stream):
+    if not await manager.close_session(
+        stream,
+        expected_session_id=session_id,
+        reason="whep delete",
+    ):
         return web.Response(status=404, text="No active WHEP session")
     return web.Response(status=200, text="Session closed")
 
@@ -552,6 +746,12 @@ async def _handle_go2rtc_ws(request: web.Request) -> web.StreamResponse:
                 pending_candidates.clear()
 
             try:
+                if current_session_id:
+                    LOGGER.info(
+                        "go2rtc WS received replacement offer stream=%s old_session=%s",
+                        stream,
+                        current_session_id,
+                    )
                 session_id, answer_sdp = await manager.create_session(
                     stream,
                     offer_sdp,
@@ -565,7 +765,11 @@ async def _handle_go2rtc_ws(request: web.Request) -> web.StreamResponse:
                 await ws.send_json({"type": "error", "value": f"webrtc/offer: {err}"})
     finally:
         if current_session_id:
-            await manager.close_session(stream)
+            await manager.close_session(
+                stream,
+                expected_session_id=current_session_id,
+                reason="go2rtc websocket disconnected",
+            )
 
     return ws
 
@@ -575,6 +779,8 @@ def create_whep_app(
     *,
     auth_token: str | None = None,
     publisher_wakeup: Callable[[], Awaitable[None]] | None = None,
+    reconnect_backoff_seconds: float = 3.0,
+    video_only: bool = False,
 ) -> web.Application:
     """Build the standalone aiohttp WHEP application.
 
@@ -587,6 +793,8 @@ def create_whep_app(
     manager = MammotionWhepManager(
         credentials_provider,
         publisher_wakeup=publisher_wakeup,
+        reconnect_backoff_seconds=reconnect_backoff_seconds,
+        video_only=video_only,
     )
     app[_MANAGER_KEY] = manager
     app[_TOKEN_KEY] = auth_token
