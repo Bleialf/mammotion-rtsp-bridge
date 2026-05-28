@@ -497,7 +497,10 @@ async def _handle_go2rtc_ws(request: web.Request) -> web.StreamResponse:
     if not stream:
         return web.Response(status=400, text="Missing ?src=...")
 
-    ws = web.WebSocketResponse(heartbeat=20.0)
+    # Do not enforce aiohttp heartbeat pings here. go2rtc's WS client can keep
+    # the signaling socket mostly idle after offer/answer, and strict heartbeat
+    # timeouts can tear down an otherwise healthy producer session.
+    ws = web.WebSocketResponse()
     await ws.prepare(request)
 
     manager = request.app[_MANAGER_KEY]
