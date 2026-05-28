@@ -142,9 +142,13 @@ async def refresh_agora_context(credentials: StreamCredentials) -> AgoraResponse
 class AgoraUpstreamSession:
     """One direct Agora session backing a WHEP consumer (go2rtc)."""
 
+    # Public stream name exposed to go2rtc/WHEP.
     stream: str
+    # Generated local lifecycle/session identifier.
     session_id: str
+    # Agora channel currently joined for this stream.
     channel: str
+    # Mammotion device/IoT ID associated with the channel.
     device_id: str
     agora_handler: AgoraWebSocketHandler
     refresh_task: asyncio.Task[None] | None = None
@@ -170,6 +174,7 @@ class MammotionWhepManager:
         self._credentials_provider = credentials_provider
         self._publisher_wakeup = publisher_wakeup
         self._lock = asyncio.Lock()
+        self._loop = asyncio.get_running_loop()
         self._sessions: dict[str, AgoraUpstreamSession] = {}
         self._stream_locks: dict[str, asyncio.Lock] = {}
         self._reconnect_backoff_seconds = reconnect_backoff_seconds
@@ -201,7 +206,7 @@ class MammotionWhepManager:
     async def _wait_for_reconnect_backoff(self, stream: str) -> None:
         """Sleep until the stream is allowed to join again."""
         retry_at = self._retry_after.get(stream, 0.0)
-        now = asyncio.get_running_loop().time()
+        now = self._loop.time()
         if retry_at <= now:
             return
         delay = retry_at - now
@@ -211,7 +216,7 @@ class MammotionWhepManager:
     def _set_reconnect_backoff(self, stream: str) -> None:
         """Delay the next join attempt for one stream."""
         self._retry_after[stream] = (
-            asyncio.get_running_loop().time() + self._reconnect_backoff_seconds
+            self._loop.time() + self._reconnect_backoff_seconds
         )
 
     async def _handle_join_failure(
