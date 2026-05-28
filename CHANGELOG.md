@@ -17,6 +17,7 @@ All notable changes to this project are documented here. Format loosely follows
 
 ### Changed
 - SDP answer generation now includes a Pion/go2rtc compatibility profile for better interop with Frigate-bundled go2rtc.
+- WebRTC passthrough now enforces go2rtc-native WS signaling; WHEP mode is treated as unsupported for Frigate/go2rtc.
 
 ### Fixed
 - Improved reconnect behavior when closing/reopening a viewer by handling trickle ICE candidates throughout the WS session lifecycle.

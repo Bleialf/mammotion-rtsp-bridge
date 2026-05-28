@@ -75,13 +75,14 @@ Key environment variables for passthrough mode:
 | `MAMMOTION_STREAM_NAME` | `mammotion` | Stream name created/maintained in go2rtc |
 | `MAMMOTION_WHEP_HOST` | container hostname | Hostname go2rtc uses to reach this bridge |
 | `MAMMOTION_WHEP_PORT` | `8555` | WHEP/WS signaling listen port |
-| `MAMMOTION_GO2RTC_SIGNALING` | `http` | Signaling mode: `http` (WHEP) or `ws` (go2rtc-native WS) |
+| `MAMMOTION_GO2RTC_SIGNALING` | `ws` | WS signaling mode only (`webrtc:ws://.../api/ws?src=...`). Other values are ignored and forced to `ws`. |
 | `MAMMOTION_GO2RTC_RECONCILE_SECONDS` | `20` | Periodically re-ensures stream registration after go2rtc/Frigate restarts |
 | `MAMMOTION_KEEPALIVE_SECONDS` | `10` | MQTT keep-alive cadence to keep the mower publishing |
 
 Recommended for Frigate/go2rtc right now:
 
 - Set `MAMMOTION_GO2RTC_SIGNALING=ws`.
+- WHEP is unsupported here; the bridge now runs WS-only for Frigate/go2rtc.
 - Keep `MAMMOTION_GO2RTC_RECONCILE_SECONDS` enabled so stream registration
   self-heals after Frigate restarts.
 
