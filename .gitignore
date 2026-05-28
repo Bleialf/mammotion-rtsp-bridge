@@ -23,9 +23,11 @@ xdump_config
 # Reference downloads (not part of this project)
 Mammotion-HA-main/
 PyMammotion-main/
+homeassistant_petkit-main/
 
 # IDE / OS
 .idea/
 .vscode/
+.claude/
 .DS_Store
 Thumbs.db
