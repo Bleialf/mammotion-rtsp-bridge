@@ -348,6 +348,31 @@ def _parse_trickle_candidates(sdp_fragment: str) -> list[RTCIceCandidateInit]:
 _MANAGER_KEY = web.AppKey("mammotion_whep_manager", MammotionWhepManager)
 _TOKEN_KEY = web.AppKey("mammotion_whep_token", object)
 
+# Permissive CORS so a browser WHEP test page can hit the bridge directly for
+# diagnostics. WHEP normally runs server-to-server (go2rtc → us); a browser
+# served from a different origin needs Access-Control-Allow-Origin or the
+# preflight OPTIONS fails and fetch() can't even send the POST.
+_CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, PATCH, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    "Access-Control-Expose-Headers": "Location",
+    "Access-Control-Max-Age": "600",
+}
+
+
+@web.middleware
+async def _cors_middleware(
+    request: web.Request,
+    handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+) -> web.StreamResponse:
+    if request.method == "OPTIONS":
+        return web.Response(status=204, headers=_CORS_HEADERS)
+    response = await handler(request)
+    for key, value in _CORS_HEADERS.items():
+        response.headers.setdefault(key, value)
+    return response
+
 
 def _check_auth(request: web.Request) -> web.Response | None:
     """Optional static bearer-token gate (env MAMMOTION_WHEP_TOKEN)."""
@@ -431,7 +456,7 @@ def create_whep_app(
       * ``PATCH  /whep/{stream}/{session_id}``     -> trickle ICE
       * ``DELETE /whep/{stream}/{session_id}``     -> teardown
     """
-    app = web.Application()
+    app = web.Application(middlewares=[_cors_middleware])
     manager = MammotionWhepManager(
         credentials_provider,
         publisher_wakeup=publisher_wakeup,
