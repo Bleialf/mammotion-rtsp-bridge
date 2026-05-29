@@ -1,4 +1,8 @@
-pymammotion==0.7.115
+pymammotion==0.7.131
+# Note: 0.7.83–0.7.116 are gated to Python 3.14 only; we're on 3.13 here,
+# so we pick the first version in the post-3.14-gate range. Same 0.7 minor,
+# API surface used by the bridge (MammotionClient, get_stream_subscription,
+# send_command_with_args, device_registry) is unchanged.
 agora-python-server-sdk==2.4.5
 requests==2.32.5
 # WebRTC passthrough bridge (webrtc-passthrough branch): standalone WHEP server
