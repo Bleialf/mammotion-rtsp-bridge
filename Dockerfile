@@ -1,6 +1,10 @@
-FROM python:3.12-slim
-# Pinned to 3.12 because PyAV (av) has no prebuilt wheel for 3.14 yet and we
-# don't want to pull in a full ffmpeg build toolchain just to compile it.
+FROM python:3.13-slim
+# Pinned to 3.13 to thread the needle between two upstream constraints:
+#   - PyAV (av) has no prebuilt wheel for Python 3.14 yet (we'd have to pull
+#     in the full ffmpeg dev toolchain to compile it from source).
+#   - pymammotion 0.7.x sets python_requires>=3.13 (on 3.12 only legacy 0.2.x
+#     is installable, with an incompatible API).
+# 3.13 has wheels for both.
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
