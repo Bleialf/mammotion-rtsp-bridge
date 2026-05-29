@@ -1,17 +1,20 @@
-# WebRTC WS passthrough bridge (WS-only, recommended path).
-# Runs alongside (not instead of) your existing stream setup, using a distinct
-# stream name `mammotion_webrtc` so you can A/B compare safely.
+# Mammotion Agora → RTSP passthrough bridge (aiortc-relay branch).
 #
-# Paste this service into your Frigate compose (so it shares Frigate's network
-# and can reach `frigate:1984` + be reached at `mammotion-webrtc:8555`), or run
-# it as its own project attached to Frigate's network (see networks note).
+# The bridge subscribes to the mower's Agora WebRTC channel using a patched
+# aiortc stack and exposes the H265 stream as a plain RTSP server which go2rtc
+# (Frigate's bundled one or a standalone instance) consumes via `rtsp://`.
+# No ffmpeg, no transcoding, one process.
+#
+# Paste this service into your Frigate compose so it shares Frigate's network
+# (lets the bridge reach `frigate:1984` for the go2rtc REST API, and lets
+# go2rtc reach the bridge at `mammotion-webrtc:8554` for RTSP).
 
 services:
   mammotion-webrtc:
     container_name: mammotion-webrtc
-    # Released image tag (multi-arch).
-    image: ghcr.io/bleialf/mammotion-rtsp-bridge:0.1.2
-    # ...or build locally from the branch checkout instead:
+    # Latest aiortc-relay build:
+    image: ghcr.io/bleialf/mammotion-rtsp-bridge:aiortc-test
+    # ...or build locally from this checkout:
     # build:
     #   context: .
     #   dockerfile: Dockerfile
@@ -20,13 +23,13 @@ services:
       BRIDGE_SCRIPT: "mammotion_webrtc_bridge.py"
       MAMMOTION_EMAIL: "your@email.com"
       MAMMOTION_PASSWORD: "your-password"
-      # go2rtc REST API (Frigate's bundled go2rtc by default):
+      # go2rtc REST API base used for stream registration.
       GO2RTC_API_URL: "http://frigate:1984"
-      # Distinct name so it coexists with your existing `mammotion` RTSP stream:
+      # Distinct go2rtc stream name so it coexists with any existing
+      # `mammotion` RTSP stream you may already have wired.
       MAMMOTION_STREAM_NAME: "mammotion_webrtc"
-      # Legacy var name retained for compatibility; defines the host go2rtc
-      # uses to dial the bridge WS endpoint.
-      MAMMOTION_WHEP_HOST: "mammotion-webrtc"
+      # Host go2rtc uses to dial the bridge's RTSP server.
+      MAMMOTION_RTSP_HOST: "mammotion-webrtc"
 
     # If this is a SEPARATE compose project from Frigate, attach to Frigate's
     # network (find it with `docker network ls`) so `frigate` resolves:

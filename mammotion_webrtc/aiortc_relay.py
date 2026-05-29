@@ -1,30 +1,27 @@
-"""aiortc-based Agora ↔ go2rtc passthrough relay.
+"""Agora → RTSP H265 passthrough relay.
 
-Bridges around Pion's interop issue with Agora's edge by putting a
-libwebrtc-equivalent stack (aiortc, Python) in the path:
+Owns one upstream aiortc ``RTCPeerConnection`` that subscribes to the
+mower's Agora channel as a passive viewer, and forwards every received
+H265 RTP packet to an embedded :class:`Go2RtcRtspStream` that go2rtc
+consumes via ``rtsp://``. Path:
 
-  Mower → Agora SFU → [aiortc upstream PC in bridge] ─MediaRelay─→
-                                                         │
-              [per-downstream aiortc PC] → go2rtc (Pion) → Frigate
+    Mower → Agora SFU → aiortc upstream PC → RTP tap → RTSP → go2rtc
 
-Both ends now speak standards-compliant WebRTC against aiortc. Pion never
-talks to Agora's edge directly. No transcoding, no ffmpeg: H265 RTP packets
-flow through aiortc as a relayed MediaStreamTrack.
+The aiortc codec stack is monkey-patched in :mod:`.h265_patch` so the SDP
+offer/answer can carry H265 PT 100 and the receiver does not drop packets
+or crash its decoder thread. Once the patches are in place aiortc is happy
+to ferry the H265 bytes through SRTP and out the other side; we never
+decode anything.
 
 Lifecycle:
 
-* The upstream Agora subscription is lazily started on the first downstream
-  request and shared across all current downstream consumers via
-  :class:`aiortc.contrib.media.MediaRelay`.
-* When the last downstream PC disconnects, the upstream is kept warm for
-  ``grace_seconds`` then torn down so we are not paying for an idle Agora
-  session.
-* If the upstream PC fails (connectionState=failed/closed), it is dropped;
-  the next downstream request triggers a fresh subscription.
-
-This module intentionally keeps no fancy session reuse, no health tracking,
-no replacement guards. The aiortc-side connections do their own health
-management; we just spin them up/down.
+* Eager start: ``await start()`` kicks off the supervisor task. Frigate is
+  always-on, so a lazy/idle-grace teardown adds no value and risks the
+  upstream not being ready when the first viewer asks.
+* Self-healing: the supervisor reconnects on upstream failure with a
+  bounded backoff. Each retry refetches credentials via the provider so
+  expired Agora tokens are handled implicitly.
+* ``await stop()`` tears down both the PC and the RTSP server cleanly.
 """
 
 from __future__ import annotations
@@ -32,221 +29,144 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
-from collections.abc import Awaitable, Callable
 
-from aiortc import RTCIceCandidate, RTCPeerConnection, RTCSessionDescription
-from aiortc.contrib.media import MediaRelay
+from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import MediaStreamTrack
-from aiortc.rtcrtpsender import RTCRtpSender
-from aiortc.sdp import candidate_from_sdp
+from aiortc.rtp import RtpPacket, unwrap_rtx
 
-from .agora_edge import (
-    AgoraResponse,
-    AgoraWebSocketHandler,
+from . import h265_patch
+from .agora_edge import AgoraWebSocketHandler
+from .agora_session import (
+    AgoraContextProvider,
+    CredentialsProvider,
+    PublisherWakeup,
 )
+from .rtsp_server import Go2RtcRtspStream
+
+# Apply the H265 patches once at import time. The bridge entrypoint imports
+# this module before constructing any RTCPeerConnection, so this is safe.
+h265_patch.apply()
 
 LOGGER = logging.getLogger(__name__)
 
 
-# Type aliases for the callbacks the bridge entrypoint provides.
-CredentialsProvider = Callable[[], Awaitable["object"]]
-AgoraContextProvider = Callable[["object"], Awaitable[AgoraResponse]]
-PublisherWakeup = Callable[[], Awaitable[None]] | None
+class AgoraToRtspRelay:
+    """Bridge from Agora WebRTC to a local RTSP server.
 
-
-class AgoraAiortcRelay:
-    """One stream of Mammotion video, relayed through aiortc.
-
-    A single instance owns at most one upstream Agora ``RTCPeerConnection``
-    and synthesises a fresh downstream ``RTCPeerConnection`` per consumer
-    that subscribes to the same upstream tracks via ``MediaRelay``.
+    One instance owns one upstream PC and one RTSP server. The RTSP server
+    is shared across all go2rtc consumers (typically just one — go2rtc
+    multiplexes its own viewers internally).
     """
 
     def __init__(
         self,
+        *,
         credentials_provider: CredentialsProvider,
         agora_context_provider: AgoraContextProvider,
-        *,
+        rtsp_server: Go2RtcRtspStream,
         publisher_wakeup: PublisherWakeup = None,
         upstream_track_timeout_seconds: float = 15.0,
-        idle_grace_seconds: float = 30.0,
+        reconnect_backoff_seconds: float = 5.0,
+        max_reconnect_backoff_seconds: float = 60.0,
     ) -> None:
         self._credentials_provider = credentials_provider
         self._agora_context_provider = agora_context_provider
+        self._rtsp_server = rtsp_server
         self._publisher_wakeup = publisher_wakeup
         self._upstream_track_timeout = upstream_track_timeout_seconds
-        self._idle_grace = idle_grace_seconds
+        self._reconnect_backoff = reconnect_backoff_seconds
+        self._max_reconnect_backoff = max_reconnect_backoff_seconds
 
-        self._lock = asyncio.Lock()
+        self._stop_event = asyncio.Event()
         self._upstream_pc: RTCPeerConnection | None = None
         self._upstream_handler: AgoraWebSocketHandler | None = None
-        self._upstream_session_id: str | None = None
-        self._video_track: MediaStreamTrack | None = None
-        self._audio_track: MediaStreamTrack | None = None
-        self._tracks_ready = asyncio.Event()
-        self._relay = MediaRelay()
-        self._downstream_pcs: set[RTCPeerConnection] = set()
-        self._idle_cleanup_task: asyncio.Task[None] | None = None
-
-    @property
-    def active_downstream_count(self) -> int:
-        return len(self._downstream_pcs)
+        self._supervisor_task: asyncio.Task[None] | None = None
+        # The receiver associated with the inbound video track. Cached so
+        # the RTSP server can ask us to PLI upstream when a new client joins.
+        self._video_receiver = None
+        # SSRC of the inbound H265 stream — needed for the PLI we send on
+        # behalf of new RTSP clients. None until the first packet arrives.
+        self._video_ssrc: int | None = None
+        # Set when the upstream PC reaches "connected"; cleared on teardown.
+        self._upstream_ready = asyncio.Event()
 
     # ------------------------------------------------------------------
-    # Public entry point
+    # Public API
     # ------------------------------------------------------------------
 
-    async def negotiate_downstream(
-        self, offer_sdp: str
-    ) -> tuple[RTCPeerConnection, str]:
-        """Handle one downstream offer, return (pc, answer_sdp).
+    async def start(self) -> None:
+        if self._supervisor_task is not None and not self._supervisor_task.done():
+            return
+        self._stop_event.clear()
+        self._supervisor_task = asyncio.create_task(self._supervise())
 
-        The PC handle is returned so the caller can feed trickled ICE
-        candidates from the downstream client via :meth:`add_remote_candidate`.
+    async def stop(self) -> None:
+        self._stop_event.set()
+        if self._supervisor_task is not None:
+            self._supervisor_task.cancel()
+            try:
+                await self._supervisor_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._supervisor_task = None
+        await self._teardown_upstream()
+
+    async def request_keyframe(self) -> None:
+        """Send a PLI to Agora asking for an IDR.
+
+        Called by the RTSP server when a new client connects, so the viewer
+        does not have to wait for the next naturally-scheduled keyframe.
+        Silently no-ops if upstream is not ready or the SSRC is unknown.
         """
-        await self._ensure_upstream()
-        if self._video_track is None:
-            raise RuntimeError("Upstream video track unavailable; cannot relay")
-
-        pc = RTCPeerConnection()
-        video_sender = pc.addTrack(self._relay.subscribe(self._video_track))
-        if self._audio_track is not None:
-            pc.addTrack(self._relay.subscribe(self._audio_track))
-
-        @pc.on("connectionstatechange")
-        async def _on_state() -> None:
-            LOGGER.info("Downstream PC connectionState=%s", pc.connectionState)
-            if pc.connectionState in ("failed", "closed", "disconnected"):
-                await self._detach_downstream(pc)
-
-        # Force H265 first in the answer so aiortc passes the upstream H265
-        # RTP through verbatim instead of transcoding to H264. aiortc's
-        # default codec ordering puts VP8/H264 ahead of H265, so without
-        # this hint negotiation picks H264 and triggers a decode + re-encode
-        # pipeline that silently produces no media for the Mammotion stream.
-        # Must be called BEFORE setRemoteDescription/createAnswer to affect
-        # the answer's codec ordering.
-        try:
-            video_codecs = RTCRtpSender.getCapabilities("video").codecs
-            h265 = [c for c in video_codecs if "h265" in c.mimeType.lower()]
-            other = [c for c in video_codecs if "h265" not in c.mimeType.lower()]
-            preferred = h265 + other
-            for transceiver in pc.getTransceivers():
-                if transceiver.sender is video_sender and preferred:
-                    transceiver.setCodecPreferences(preferred)
-                    LOGGER.info(
-                        "Set downstream video codec preferences (H265-first): %s",
-                        [c.mimeType for c in preferred],
-                    )
-                    break
-            if not h265:
-                LOGGER.warning(
-                    "aiortc reports no H265 sender capability; relay will "
-                    "transcode H265 -> H264 (may not work)"
-                )
-        except Exception:  # noqa: BLE001
-            LOGGER.exception("Failed to set H265-first codec preferences")
-
-        await pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type="offer"))
-        answer = await pc.createAnswer()
-        await pc.setLocalDescription(answer)
-
-        # TEMP diagnostics: log both the downstream offer (what go2rtc/Pion
-        # asks for) and the downstream answer aiortc generated. We need to
-        # see whether H265 actually gets negotiated end-to-end — if go2rtc
-        # offers only H264/VP8, aiortc has to either transcode (heavy) or
-        # mark the m-line inactive (no media).
-        LOGGER.info(
-            "DOWNSTREAM OFFER (from consumer):\n%s\n---\n"
-            "DOWNSTREAM ANSWER (from aiortc):\n%s",
-            offer_sdp,
-            pc.localDescription.sdp,
-        )
-
-        self._downstream_pcs.add(pc)
-        self._cancel_idle_cleanup()
-        LOGGER.info(
-            "Relayed downstream attached; active_downstream=%d",
-            len(self._downstream_pcs),
-        )
-        return pc, pc.localDescription.sdp
-
-    async def add_remote_candidate(
-        self,
-        pc: RTCPeerConnection,
-        candidate_line: str,
-        sdp_m_line_index: int | None = None,
-        sdp_mid: str | None = None,
-    ) -> None:
-        """Parse one ``candidate:`` line and add it to a downstream PC.
-
-        ``candidate_line`` may begin with ``a=candidate:`` or just
-        ``candidate:``; both are accepted. Empty string is treated as
-        end-of-candidates and silently ignored.
-        """
-        if pc not in self._downstream_pcs:
-            return
-        raw = (candidate_line or "").strip()
-        if raw.startswith("a="):
-            raw = raw[2:]
-        if not raw or not raw.startswith("candidate:"):
+        receiver = self._video_receiver
+        ssrc = self._video_ssrc
+        if receiver is None or ssrc is None:
             return
         try:
-            candidate = candidate_from_sdp(raw[len("candidate:"):])
+            await receiver._send_rtcp_pli(ssrc)
         except Exception:  # noqa: BLE001
-            LOGGER.exception("Failed to parse downstream ICE candidate: %s", raw)
-            return
-        # aiortc requires at least one of sdpMid / sdpMLineIndex. go2rtc's WS
-        # protocol omits both, so default to mLineIndex=0 (works with BUNDLE'd
-        # PCs where everything shares one transport).
-        candidate.sdpMLineIndex = sdp_m_line_index if sdp_m_line_index is not None else 0
-        if sdp_mid is not None:
-            candidate.sdpMid = sdp_mid
-        try:
-            await pc.addIceCandidate(candidate)
-        except Exception:  # noqa: BLE001
-            LOGGER.exception("Failed to add downstream ICE candidate to PC")
-
-    async def close_downstream(self, pc: RTCPeerConnection) -> None:
-        """Explicit teardown for one downstream PC (e.g. WS disconnect)."""
-        await self._detach_downstream(pc)
-
-    async def close(self) -> None:
-        """Drop all downstream PCs and the upstream subscription."""
-        async with self._lock:
-            for pc in list(self._downstream_pcs):
-                try:
-                    await pc.close()
-                except Exception:  # noqa: BLE001
-                    LOGGER.exception("Failed to close downstream PC during shutdown")
-            self._downstream_pcs.clear()
-            await self._close_upstream_locked()
-            self._cancel_idle_cleanup()
+            LOGGER.debug("PLI to upstream failed", exc_info=True)
 
     # ------------------------------------------------------------------
-    # Upstream lifecycle (lock-held)
+    # Supervisor loop — reconnect-with-backoff
     # ------------------------------------------------------------------
 
-    async def _ensure_upstream(self) -> None:
-        async with self._lock:
-            if self._upstream_alive():
+    async def _supervise(self) -> None:
+        backoff = self._reconnect_backoff
+        while not self._stop_event.is_set():
+            try:
+                await self._run_one_upstream()
+                # Clean exit (upstream disconnected on its own). Reset backoff
+                # so a steady-state churn does not push retry delay up.
+                backoff = self._reconnect_backoff
+            except asyncio.CancelledError:
                 return
-            await self._start_upstream_locked()
+            except Exception:  # noqa: BLE001
+                LOGGER.exception(
+                    "Upstream connection failed; will retry in %.1fs", backoff
+                )
+            finally:
+                await self._teardown_upstream()
 
-    def _upstream_alive(self) -> bool:
-        pc = self._upstream_pc
-        if pc is None:
-            return False
-        return pc.connectionState in ("new", "connecting", "connected")
+            if self._stop_event.is_set():
+                return
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=backoff)
+                # If we got here without timing out, stop was requested.
+                return
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(backoff * 2, self._max_reconnect_backoff)
 
-    async def _start_upstream_locked(self) -> None:
-        LOGGER.info("Starting aiortc upstream subscription to Agora")
+    async def _run_one_upstream(self) -> None:
+        """Bring up one Agora subscription and pump RTP until it dies."""
+        LOGGER.info("Starting upstream Agora subscription")
 
         if self._publisher_wakeup is not None:
             try:
                 await self._publisher_wakeup()
             except Exception:  # noqa: BLE001
-                LOGGER.exception("Publisher wakeup failed; continuing")
+                LOGGER.exception("Publisher wakeup failed; continuing anyway")
 
         credentials = await self._credentials_provider()
         agora_response = await self._agora_context_provider(credentials)
@@ -255,26 +175,31 @@ class AgoraAiortcRelay:
         pc.addTransceiver("video", direction="recvonly")
         pc.addTransceiver("audio", direction="recvonly")
 
-        self._tracks_ready.clear()
-        self._video_track = None
-        self._audio_track = None
+        # Per-attempt state for the track and connection-state events.
+        track_received = asyncio.Event()
+        connection_failed = asyncio.Event()
+        video_track_ref: dict[str, MediaStreamTrack] = {}
 
         @pc.on("track")
         def _on_track(track: MediaStreamTrack) -> None:
-            LOGGER.info("Upstream aiortc track received kind=%s id=%s", track.kind, track.id)
-            if track.kind == "video" and self._video_track is None:
-                self._video_track = track
-                self._tracks_ready.set()
-            elif track.kind == "audio" and self._audio_track is None:
-                self._audio_track = track
+            LOGGER.info(
+                "Upstream aiortc track received kind=%s id=%s", track.kind, track.id
+            )
+            if track.kind != "video" or "video" in video_track_ref:
+                return
+            video_track_ref["video"] = track
+            self._install_rtp_tap(pc, track)
+            track_received.set()
 
         @pc.on("connectionstatechange")
-        async def _on_state() -> None:
-            LOGGER.info("Upstream aiortc connectionState=%s", pc.connectionState)
-            if pc.connectionState in ("failed", "closed", "disconnected"):
-                async with self._lock:
-                    if self._upstream_pc is pc:
-                        await self._close_upstream_locked()
+        def _on_state() -> None:
+            state = pc.connectionState
+            LOGGER.info("Upstream aiortc connectionState=%s", state)
+            if state == "connected":
+                self._upstream_ready.set()
+            elif state in ("failed", "closed", "disconnected"):
+                self._upstream_ready.clear()
+                connection_failed.set()
 
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
@@ -286,125 +211,164 @@ class AgoraAiortcRelay:
             declare_remote_video_ssrc=True,
         )
         session_id = secrets.token_hex(16)
-        try:
-            answer_sdp = await handler.connect_and_join(
-                live_feed=credentials.to_agora_credentials(),
-                offer_sdp=pc.localDescription.sdp,
-                session_id=session_id,
-                app_id=credentials.app_id,
-                agora_response=agora_response,
-            )
-        except Exception:
-            await pc.close()
-            raise
 
-        if not answer_sdp:
-            await pc.close()
-            try:
-                await handler.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
-            raise RuntimeError("Agora signaling returned no answer SDP")
-
-        try:
-            await pc.setRemoteDescription(
-                RTCSessionDescription(sdp=answer_sdp, type="answer")
-            )
-        except Exception:
-            await pc.close()
-            try:
-                await handler.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
-            raise
-
+        # Track these so _teardown_upstream can clean them up even if we
+        # bail out partway through this method.
         self._upstream_pc = pc
         self._upstream_handler = handler
-        self._upstream_session_id = session_id
+
+        answer_sdp = await handler.connect_and_join(
+            live_feed=credentials.to_agora_credentials(),
+            offer_sdp=pc.localDescription.sdp,
+            session_id=session_id,
+            app_id=credentials.app_id,
+            agora_response=agora_response,
+        )
+        if not answer_sdp:
+            raise RuntimeError("Agora signaling returned no answer SDP")
+
+        await pc.setRemoteDescription(
+            RTCSessionDescription(sdp=answer_sdp, type="answer")
+        )
 
         try:
-            await asyncio.wait_for(self._tracks_ready.wait(), timeout=self._upstream_track_timeout)
-        except asyncio.TimeoutError:
-            LOGGER.error(
-                "Upstream video track did not arrive within %.1fs; closing",
-                self._upstream_track_timeout,
+            await asyncio.wait_for(
+                track_received.wait(), timeout=self._upstream_track_timeout
             )
-            await self._close_upstream_locked()
-            raise
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"Upstream video track did not arrive within "
+                f"{self._upstream_track_timeout:.1f}s"
+            )
 
-        LOGGER.info(
-            "Upstream aiortc subscription ready session=%s", self._upstream_session_id
-        )
+        LOGGER.info("Upstream ready (session=%s); pumping RTP to RTSP server", session_id)
 
-    async def _close_upstream_locked(self) -> None:
-        if self._upstream_handler is not None:
-            try:
-                await self._upstream_handler.disconnect()
-            except Exception:  # noqa: BLE001
-                LOGGER.exception("Failed to disconnect Agora handler")
-            self._upstream_handler = None
-
-        if self._upstream_pc is not None:
-            try:
-                await self._upstream_pc.close()
-            except Exception:  # noqa: BLE001
-                LOGGER.exception("Failed to close upstream PC")
-            self._upstream_pc = None
-
-        self._upstream_session_id = None
-        self._video_track = None
-        self._audio_track = None
-        self._tracks_ready.clear()
-
-    # ------------------------------------------------------------------
-    # Downstream lifecycle
-    # ------------------------------------------------------------------
-
-    async def _detach_downstream(self, pc: RTCPeerConnection) -> None:
-        if pc not in self._downstream_pcs:
-            return
-        self._downstream_pcs.discard(pc)
-        LOGGER.info(
-            "Downstream PC detached; active_downstream=%d",
-            len(self._downstream_pcs),
-        )
+        # Hold until the connection dies or we are asked to stop. The actual
+        # RTP forwarding happens in the receiver-hook coroutine; this task
+        # just waits.
+        stop_wait = asyncio.create_task(self._stop_event.wait())
+        failed_wait = asyncio.create_task(connection_failed.wait())
         try:
-            await pc.close()
-        except Exception:  # noqa: BLE001
-            pass
-        if not self._downstream_pcs:
-            self._schedule_idle_cleanup()
+            await asyncio.wait(
+                {stop_wait, failed_wait}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            for task in (stop_wait, failed_wait):
+                if not task.done():
+                    task.cancel()
 
-    def _schedule_idle_cleanup(self) -> None:
-        if self._idle_grace <= 0:
-            asyncio.create_task(self._idle_cleanup_now())
+    # ------------------------------------------------------------------
+    # RTP tap — the actual passthrough
+    # ------------------------------------------------------------------
+
+    def _install_rtp_tap(self, pc: RTCPeerConnection, track: MediaStreamTrack) -> None:
+        """Hook the receiver's RTP handler so each H265 packet goes to RTSP.
+
+        We wrap ``receiver._handle_rtp_packet`` rather than tapping deeper
+        because that point lets us still call the original handler — which
+        keeps RTCP RR / NACK / PLI flowing back to Agora. Without those,
+        Agora's edge eventually decides the subscription is stale and
+        either stops sending or drops the session.
+
+        The original handler is left in charge of RTX unwrapping; we mirror
+        that work locally so our tap sees the recovered packet too. Losing
+        RTX recovery would translate to visible glitches on any path with
+        non-trivial loss.
+        """
+        receiver = None
+        for transceiver in pc.getTransceivers():
+            if transceiver.receiver is not None and transceiver.receiver.track is track:
+                receiver = transceiver.receiver
+                break
+        if receiver is None:
+            LOGGER.error("Could not locate RTCRtpReceiver for video track")
             return
 
-        if self._idle_cleanup_task is not None and not self._idle_cleanup_task.done():
-            return
+        self._video_receiver = receiver
+        original_handler = receiver._handle_rtp_packet
+        rtsp_server = self._rtsp_server
 
-        async def _later() -> None:
+        # Pull the receiver's private name-mangled attributes once. These
+        # are stable across aiortc 1.13.x — if a future version reorganises
+        # them, the patch reapplication step in h265_patch.py is where we
+        # would notice.
+        codecs_by_pt = receiver._RTCRtpReceiver__codecs  # noqa: SLF001
+        rtx_ssrc_map = receiver._RTCRtpReceiver__rtx_ssrc  # noqa: SLF001
+
+        relay_self = self
+
+        async def tap(packet: RtpPacket, arrival_time_ms: int) -> None:
             try:
-                await asyncio.sleep(self._idle_grace)
-            except asyncio.CancelledError:
-                return
-            async with self._lock:
-                if not self._downstream_pcs:
-                    LOGGER.info(
-                        "Idle grace expired (%.1fs); closing upstream",
-                        self._idle_grace,
-                    )
-                    await self._close_upstream_locked()
+                effective = _unwrap_rtx_if_needed(packet, codecs_by_pt, rtx_ssrc_map)
+                # Match codec by MIME type, not PT — the negotiated H265 PT
+                # is whatever Agora picked in the answer, not the offer-side
+                # constant in :mod:`h265_patch`.
+                codec = codecs_by_pt.get(effective.payload_type)
+                if codec is not None and codec.mimeType.lower() in h265_patch.H265_MIMETYPES:
+                    if relay_self._video_ssrc is None:
+                        relay_self._video_ssrc = effective.ssrc
+                    if effective.payload:
+                        rtsp_server.push_rtp(
+                            payload=bytes(effective.payload),
+                            timestamp=effective.timestamp,
+                            marker=bool(effective.marker),
+                        )
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("RTP tap failed; dropping packet")
+            await original_handler(packet, arrival_time_ms=arrival_time_ms)
 
-        self._idle_cleanup_task = asyncio.create_task(_later())
+        receiver._handle_rtp_packet = tap
 
-    async def _idle_cleanup_now(self) -> None:
-        async with self._lock:
-            if not self._downstream_pcs:
-                await self._close_upstream_locked()
+    # ------------------------------------------------------------------
+    # Teardown
+    # ------------------------------------------------------------------
 
-    def _cancel_idle_cleanup(self) -> None:
-        task = self._idle_cleanup_task
-        if task is not None and not task.done():
-            task.cancel()
-        self._idle_cleanup_task = None
+    async def _teardown_upstream(self) -> None:
+        handler = self._upstream_handler
+        pc = self._upstream_pc
+        self._upstream_handler = None
+        self._upstream_pc = None
+        self._video_receiver = None
+        self._video_ssrc = None
+        self._upstream_ready.clear()
+
+        if handler is not None:
+            try:
+                await handler.disconnect()
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Agora handler disconnect failed")
+        if pc is not None:
+            try:
+                await pc.close()
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Upstream PC close failed")
+
+
+def _unwrap_rtx_if_needed(
+    packet: RtpPacket,
+    codecs_by_pt: dict,
+    rtx_ssrc_map: dict,
+) -> RtpPacket:
+    """Mirror :meth:`RTCRtpReceiver._handle_rtp_packet`'s RTX unwrap.
+
+    Returns the original packet unchanged if it is not RTX or if any input
+    needed for unwrap is missing. The receiver's own copy of this logic
+    still runs (we did not disturb the original handler), so this is purely
+    for our tap.
+    """
+    codec = codecs_by_pt.get(packet.payload_type)
+    if codec is None or codec.name.lower() != "rtx":
+        return packet
+    original_ssrc = rtx_ssrc_map.get(packet.ssrc)
+    apt = codec.parameters.get("apt")
+    if (
+        original_ssrc is None
+        or not isinstance(apt, int)
+        or apt not in codecs_by_pt
+        or len(packet.payload) < 2
+    ):
+        return packet
+    try:
+        return unwrap_rtx(packet, payload_type=apt, ssrc=original_ssrc)
+    except Exception:  # noqa: BLE001
+        return packet

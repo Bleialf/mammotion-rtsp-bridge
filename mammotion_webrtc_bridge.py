@@ -1,37 +1,34 @@
 #!/usr/bin/env python3
-"""Standalone Mammotion Agora -> go2rtc WebRTC passthrough bridge.
+"""Mammotion Agora → RTSP passthrough bridge.
 
-This is the entrypoint for the WHEP/WebRTC passthrough approach (branch
-``webrtc-passthrough``). Unlike the main-branch ``mammotion_go2rtc_bridge.py``
-(which pulls encoded frames and re-muxes through ffmpeg -> RTSP), this service
-never touches the media. It:
+Single-process bridge for delivering the Mammotion mower's H265 camera into
+go2rtc/Frigate without ffmpeg, transcoding, or a second WebRTC hop. Flow:
 
-1. Logs into Mammotion (pymammotion), fetching the Agora stream subscription
-   (appid / channelName / token / uid / areaCode), reusing the same pattern as
-   the main-branch bridge (``fetch_stream_fields`` / ``_fresh_client``).
-2. Starts a standalone aiohttp WHEP server (``mammotion_webrtc.whep_server``)
-   that brokers go2rtc's SDP offer into an Agora-derived answer.
-3. Registers a go2rtc stream named ``mammotion`` whose source is
-   ``webrtc:http://<self-host>:<port>/whep/mammotion`` so go2rtc dials our WHEP
-   endpoint and DTLS-SRTPs straight to the Agora edge.
-4. Runs the MQTT keep-alive loop (``send_todev_ble_sync`` sync_type=2 every
-   ~10s) so the mower's publisher stays in the Agora channel. Mammotion has no
-   RTM token, so this MQTT path replaces PetKit's RTM heartbeat.
+1. Log into Mammotion via pymammotion and fetch the Agora stream
+   subscription (appid/channelName/token/uid/areaCode) for one device.
+2. Run a supervisor that brings up an aiortc upstream peer connection to
+   Agora as a passive viewer and taps the inbound H265 RTP packets
+   (:class:`mammotion_webrtc.AgoraToRtspRelay`).
+3. Serve those packets verbatim over a minimal RTSP server bound on
+   ``MAMMOTION_RTSP_PORT`` (default 8554), mount ``/mammotion``.
+4. Register ``rtsp://<self>:<port>/mammotion`` with go2rtc via its REST
+   API so Frigate discovers the stream automatically.
+5. Keep the mower in the Agora channel by sending MQTT
+   ``send_todev_ble_sync`` every ~10s. The publisher times out without
+   this nudge; Mammotion has no RTM heartbeat.
 
 Environment variables:
-  MAMMOTION_EMAIL / MAMMOTION_PASSWORD   - cloud credentials (required)
-  MAMMOTION_DEVICE_NAME                  - device to stream ("" / "first" = first)
-  MAMMOTION_WHEP_PORT                    - WHEP listen port (default 8555)
-  MAMMOTION_WHEP_HOST                    - host go2rtc uses to reach us
-                                           (default: container hostname)
-  MAMMOTION_WHEP_BIND                    - bind address (default 0.0.0.0)
-  MAMMOTION_WHEP_TOKEN                   - optional static bearer token
-  GO2RTC_API_URL                         - go2rtc REST base (default http://frigate:1984)
-  MAMMOTION_STREAM_NAME                  - go2rtc stream name (default mammotion)
-    MAMMOTION_GO2RTC_RECONCILE_SECONDS     - periodic re-register interval
-                                                                                     (default 20)
-  MAMMOTION_KEEPALIVE_SECONDS            - MQTT keep-alive interval (default 10)
-  MAMMOTION_RECONNECT_BACKOFF_SECONDS    - login retry backoff (default 8)
+  MAMMOTION_EMAIL / MAMMOTION_PASSWORD     - cloud credentials (required)
+  MAMMOTION_DEVICE_NAME                    - device to stream ("" / "first" = first)
+  MAMMOTION_RTSP_PORT                      - RTSP listen port (default 8554)
+  MAMMOTION_RTSP_HOST                      - host go2rtc uses to reach us
+                                             (default: container hostname)
+  MAMMOTION_RTSP_BIND                      - bind address (default 0.0.0.0)
+  MAMMOTION_STREAM_NAME                    - go2rtc stream name (default mammotion)
+  GO2RTC_API_URL                           - go2rtc REST base (default http://frigate:1984)
+  MAMMOTION_GO2RTC_RECONCILE_SECONDS       - periodic re-register interval (default 20)
+  MAMMOTION_KEEPALIVE_SECONDS              - MQTT keep-alive interval (default 10)
+  MAMMOTION_RECONNECT_BACKOFF_SECONDS      - login retry backoff (default 8)
 """
 
 from __future__ import annotations
@@ -43,25 +40,23 @@ import signal
 import socket
 from typing import Any
 
-from aiohttp import web
-
-from mammotion_webrtc.whep_server import (
+from mammotion_webrtc.agora_session import (
     StreamCredentials,
-    create_whep_app,
     refresh_agora_context,
 )
+from mammotion_webrtc.aiortc_relay import AgoraToRtspRelay
 from mammotion_webrtc.go2rtc_register import Go2RTCStreamRegistrar
+from mammotion_webrtc.rtsp_server import Go2RtcRtspStream
 
 LOGGER = logging.getLogger("mammotion_webrtc_bridge")
 
 # Minimum seconds between get_stream_subscription calls. Each call re-triggers
-# the mower to publish but also hits the cloud, so we debounce go2rtc's rapid
-# WHEP retries to avoid an account lockout.
+# the mower's publish but also hits the cloud, so we debounce rapid retries
+# to avoid an account lockout.
 CREDS_DEBOUNCE_S = 15.0
 
 # Mirrors the AREA_CODE_MAP in the main-branch bridge, but maps to the
-# "CN,GLOBAL"-style strings that Agora's choose_server REST API expects (not the
-# integer bitmask used by the native Agora SDK on main).
+# "CN,GLOBAL"-style strings the REST choose_server API expects.
 AREA_CODE_STRING_MAP = {
     "AREA_CODE_CN": "CN",
     "AREA_CODE_NA": "NA",
@@ -74,14 +69,7 @@ AREA_CODE_STRING_MAP = {
 
 
 def resolve_area_code_string(value: Any) -> str:
-    """Map a Mammotion areaCode to a choose_server area_code string.
-
-    TODO(mammotion): unverified. The main-branch bridge maps areaCode to the
-    native SDK's integer bitmask; the REST choose_server API instead wants a
-    comma list like "CN,GLOBAL". We default to "CN,GLOBAL" (Agora's own default)
-    which works for global apps. If the mower's app id is region-locked this may
-    need tuning.
-    """
+    """Map a Mammotion areaCode to a choose_server area_code string."""
     if isinstance(value, str) and value in AREA_CODE_STRING_MAP:
         region = AREA_CODE_STRING_MAP[value]
         return "CN,GLOBAL" if region in ("GLOBAL", "CN") else f"{region},GLOBAL"
@@ -89,10 +77,7 @@ def resolve_area_code_string(value: Any) -> str:
 
 
 async def fetch_stream_fields(mammotion: Any, device_name: str) -> dict[str, Any]:
-    """Fetch Agora stream subscription fields for one device.
-
-    Identical pattern to the main-branch bridge's ``fetch_stream_fields``.
-    """
+    """Fetch Agora stream subscription fields for one device."""
     selected_name = (device_name or "").strip()
     if not selected_name or selected_name.lower() == "first":
         all_devices = mammotion.device_registry.all_devices
@@ -131,7 +116,6 @@ def _env_int(name: str, default: int) -> int:
 
 
 async def main() -> None:
-    """Run the bridge: login, WHEP server, go2rtc registration, keep-alive."""
     log_level = os.getenv("MAMMOTION_LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
         level=getattr(logging, log_level, logging.INFO),
@@ -146,16 +130,16 @@ async def main() -> None:
             "Missing Mammotion credentials. Set MAMMOTION_EMAIL/MAMMOTION_PASSWORD."
         )
 
-    whep_port = _env_int("MAMMOTION_WHEP_PORT", 8555)
-    whep_bind = os.getenv("MAMMOTION_WHEP_BIND", "0.0.0.0")
-    whep_host = os.getenv("MAMMOTION_WHEP_HOST", socket.gethostname())
-    whep_token = os.getenv("MAMMOTION_WHEP_TOKEN") or None
+    rtsp_port = _env_int("MAMMOTION_RTSP_PORT", 8554)
+    rtsp_bind = os.getenv("MAMMOTION_RTSP_BIND", "0.0.0.0")
+    rtsp_host = os.getenv("MAMMOTION_RTSP_HOST", socket.gethostname())
     go2rtc_api_url = os.getenv("GO2RTC_API_URL", "http://frigate:1984")
     stream_name = os.getenv("MAMMOTION_STREAM_NAME", "mammotion")
-    go2rtc_signaling = (os.getenv("MAMMOTION_GO2RTC_SIGNALING", "ws") or "ws").strip().lower()
     go2rtc_reconcile_interval = float(_env_int("MAMMOTION_GO2RTC_RECONCILE_SECONDS", 20))
     keepalive_interval = float(_env_int("MAMMOTION_KEEPALIVE_SECONDS", 10))
     reconnect_backoff = _env_int("MAMMOTION_RECONNECT_BACKOFF_SECONDS", 8)
+
+    rtsp_source = f"rtsp://{rtsp_host}:{rtsp_port}/{stream_name}"
 
     LOGGER.info("Loading Mammotion SDK modules")
     from pymammotion.client import MammotionClient
@@ -168,19 +152,19 @@ async def main() -> None:
         except NotImplementedError:
             signal.signal(sig, lambda *_: stop_async.set())
 
-    # Shared mutable state used by the credentials provider and keep-alive loop.
-    # The credentials provider is called on every new WHEP session (and on
-    # Agora token renewal), so it must always read the *current* client and
-    # device. We mutate these in place across reconnect cycles.
+    # Shared state used by the credentials provider and keep-alive loop.
     state: dict[str, Any] = {
         "mammotion": None,
         "device_name": device_name,
         "iot_id": None,
+        "credentials": None,
+        "creds_fetched_at": 0.0,
     }
 
     async def _fresh_client() -> Any | None:
-        # A fresh client + full login every cycle. The pymammotion refresh token
-        # goes stale after a few hours; starting fresh sidesteps a dead session.
+        # A fresh client + full login every cycle. The pymammotion refresh
+        # token goes stale after a few hours; starting fresh sidesteps a
+        # dead session.
         while not stop_async.is_set():
             client = MammotionClient(ha_version="3.4.23")
             try:
@@ -208,14 +192,12 @@ async def main() -> None:
         )
 
     async def credentials_provider() -> StreamCredentials:
-        """Return Agora RTC credentials, re-triggering the mower to publish.
+        """Return Agora credentials, debounced.
 
-        get_stream_subscription does double duty: it returns the RTC token AND
-        sends the MQTT command that tells the mower to (re)join Agora and start
-        publishing video (the publish window is only ~50s). So on a viewer
-        connect we must re-fetch to wake the publisher — but debounced, so
-        go2rtc's rapid WHEP retries don't hammer the cloud (which risks an
-        account lockout). Within the debounce window we return the cached creds.
+        ``get_stream_subscription`` does double duty: it returns the RTC
+        token AND sends the MQTT command that tells the mower to (re)join
+        Agora. The relay calls us on every reconnect attempt; without a
+        debounce we would hammer the cloud and risk a lockout.
         """
         mammotion = state["mammotion"]
         now = loop.time()
@@ -244,11 +226,9 @@ async def main() -> None:
     async def wake_publisher() -> None:
         """Force the mower into the Agora channel with video on.
 
-        Fired at the start of each new WHEP session. ``send_todev_ble_sync``
-        with ``sync_type=3`` is Mammotion's BLE wake (mirrors mikey0000's HA
-        flow on offer open). ``device_agora_join_channel_with_position`` with
-        ``enter_state=1`` is ``vi_switch=1`` — explicit "join Agora channel,
-        video on". Both are best-effort; failures don't block negotiation.
+        ``send_todev_ble_sync`` with ``sync_type=3`` is Mammotion's BLE wake.
+        ``device_agora_join_channel_with_position`` with ``enter_state=1``
+        is the explicit "join Agora, video on" command. Both are best-effort.
         """
         mammotion = state["mammotion"]
         device = state.get("device_name")
@@ -269,54 +249,30 @@ async def main() -> None:
         except Exception:
             LOGGER.debug("Force-join Agora channel failed", exc_info=True)
 
-    # ---- Optional aiortc relay (env MAMMOTION_RELAY_MODE=aiortc) ----
-    relay_mode = (os.getenv("MAMMOTION_RELAY_MODE", "direct") or "direct").strip().lower()
-    relay = None
-    if relay_mode == "aiortc":
-        from mammotion_webrtc.aiortc_relay import AgoraAiortcRelay
-        relay = AgoraAiortcRelay(
-            credentials_provider=credentials_provider,
-            agora_context_provider=refresh_agora_context,
-            publisher_wakeup=wake_publisher,
-        )
-        LOGGER.info("aiortc relay enabled (MAMMOTION_RELAY_MODE=aiortc)")
-    elif relay_mode != "direct":
-        LOGGER.warning(
-            "Unknown MAMMOTION_RELAY_MODE=%s; falling back to direct mode",
-            relay_mode,
-        )
-
-    # ---- Start the WHEP aiohttp server (long-lived) ----
-    app = create_whep_app(
-        credentials_provider,
-        auth_token=whep_token,
+    # Construct the RTSP server now so the relay can hold a reference even
+    # before we know the port is bound — start()/stop() are explicit below.
+    rtsp_server = Go2RtcRtspStream(
+        bind=rtsp_bind,
+        port=rtsp_port,
+        mount_point=stream_name,
+    )
+    relay = AgoraToRtspRelay(
+        credentials_provider=credentials_provider,
+        agora_context_provider=refresh_agora_context,
+        rtsp_server=rtsp_server,
         publisher_wakeup=wake_publisher,
-        relay=relay,
     )
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, whep_bind, whep_port)
-    await site.start()
-    if go2rtc_signaling != "ws":
-        LOGGER.warning(
-            "Ignoring MAMMOTION_GO2RTC_SIGNALING=%s; only ws is supported "
-            "because WHEP is currently unreliable with Frigate/go2rtc",
-            go2rtc_signaling,
-        )
-        go2rtc_signaling = "ws"
-    whep_source = f"webrtc:ws://{whep_host}:{whep_port}/api/ws?src={stream_name}"
-    LOGGER.info(
-        "WHEP server listening on %s:%s; go2rtc signaling=%s source=%s",
-        whep_bind,
-        whep_port,
-        go2rtc_signaling,
-        whep_source,
-    )
+    # Wire the RTSP server's "new viewer connected" hook back to the relay
+    # so we can opportunistically PLI Agora for a fresh keyframe — without
+    # this the new viewer waits up to one full GOP for picture.
+    rtsp_server._on_keyframe_request = lambda: asyncio.create_task(relay.request_keyframe())
 
-    registrar: Go2RTCStreamRegistrar | None = None
+    relay_started = False
     try:
-        # ---- Login + initial credential fetch (so the provider works) ----
-        while not stop_async.is_set():
+        # ---- Login + initial credential fetch ----
+        # The supervisor cannot start until we have *some* credentials cached,
+        # because credentials_provider's first run feeds the initial PC.
+        while not stop_async.is_set() and state["mammotion"] is None:
             mammotion = await _fresh_client()
             if mammotion is None:
                 break
@@ -331,6 +287,7 @@ async def main() -> None:
                 state["device_name"] = fields["device_name"]
                 state["iot_id"] = fields["iot_id"]
                 state["credentials"] = _creds_from_fields(fields)
+                state["creds_fetched_at"] = loop.time()
                 LOGGER.info(
                     "Stream subscription ready for device %s (channel=%s)",
                     fields["device_name"],
@@ -344,91 +301,95 @@ async def main() -> None:
                     pass
                 state["mammotion"] = None
                 await asyncio.sleep(reconnect_backoff)
-                continue
 
-            # ---- Register the go2rtc stream (idempotent) ----
-            try:
-                registrar = Go2RTCStreamRegistrar(go2rtc_api_url)
-                async with registrar:
-                    ok = await registrar.ensure_stream(stream_name, whep_source)
-                if ok:
-                    LOGGER.info(
-                        "Registered go2rtc stream %s -> %s", stream_name, whep_source
-                    )
-                else:
-                    LOGGER.warning(
-                        "go2rtc stream registration did not confirm; go2rtc may "
-                        "register lazily on first viewer"
-                    )
-            except Exception:
-                LOGGER.exception("go2rtc stream registration failed (continuing)")
+        if stop_async.is_set():
+            return
 
-            # ---- Keep-alive loop ----
-            # Proactive keep-alive over MQTT. The mower's publisher leaves the
-            # Agora channel after ~50s without a viewer-present signal. PetKit
-            # used an RTM heartbeat; Mammotion has none, so we use MQTT
-            # send_todev_ble_sync(sync_type=2) instead.
-            next_keepalive = loop.time()
-            next_go2rtc_reconcile = loop.time()
-            while not stop_async.is_set():
-                now = loop.time()
-                if now >= next_go2rtc_reconcile:
-                    try:
-                        registrar = Go2RTCStreamRegistrar(go2rtc_api_url)
-                        async with registrar:
-                            ok = await registrar.ensure_stream(stream_name, whep_source)
-                        if ok:
-                            LOGGER.debug(
-                                "go2rtc stream %s registration is healthy", stream_name
-                            )
-                        else:
-                            LOGGER.warning(
-                                "go2rtc stream %s not confirmed; will retry in %.0fs",
-                                stream_name,
-                                go2rtc_reconcile_interval,
-                            )
-                    except Exception:
-                        LOGGER.warning(
-                            "go2rtc reconciliation failed; retrying in %.0fs",
-                            go2rtc_reconcile_interval,
-                            exc_info=True,
-                        )
-                    next_go2rtc_reconcile = now + go2rtc_reconcile_interval
+        # ---- Start RTSP server + relay supervisor ----
+        await rtsp_server.start()
+        LOGGER.info(
+            "RTSP server up: %s (bind=%s:%d)",
+            rtsp_source,
+            rtsp_bind,
+            rtsp_port,
+        )
+        await relay.start()
+        relay_started = True
 
-                if now >= next_keepalive:
-                    try:
-                        await mammotion.send_command_with_args(
-                            state["device_name"], "send_todev_ble_sync", sync_type=2
-                        )
-                    except Exception:
-                        LOGGER.debug("Keep-alive sync failed", exc_info=True)
-                        # A failing keep-alive usually means a dead cloud
-                        # session; break to re-login with a fresh client.
-                        break
-                    next_keepalive = now + keepalive_interval
+        # ---- Register the go2rtc stream + reconcile loop + keep-alive ----
+        next_keepalive = loop.time()
+        next_go2rtc_reconcile = loop.time()
+        while not stop_async.is_set():
+            now = loop.time()
+            mammotion = state["mammotion"]
+            if mammotion is None:
+                # Lost cloud session — re-login and continue. The relay's
+                # own supervisor will keep retrying with cached creds (or
+                # fail loudly on token expiry), so we do not need to tear
+                # it down here.
+                mammotion = await _fresh_client()
+                if mammotion is None:
+                    break
+                state["mammotion"] = mammotion
+
+            if now >= next_go2rtc_reconcile:
                 try:
-                    await asyncio.wait_for(stop_async.wait(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    pass
+                    async with Go2RTCStreamRegistrar(go2rtc_api_url) as registrar:
+                        ok = await registrar.ensure_stream(stream_name, rtsp_source)
+                    if ok:
+                        LOGGER.debug(
+                            "go2rtc stream %s wired to %s", stream_name, rtsp_source
+                        )
+                    else:
+                        LOGGER.warning(
+                            "go2rtc stream %s not confirmed; will retry in %.0fs",
+                            stream_name,
+                            go2rtc_reconcile_interval,
+                        )
+                except Exception:
+                    LOGGER.warning(
+                        "go2rtc reconciliation failed; retrying in %.0fs",
+                        go2rtc_reconcile_interval,
+                        exc_info=True,
+                    )
+                next_go2rtc_reconcile = now + go2rtc_reconcile_interval
 
-            # Cycle ended (stop or keep-alive failure). Tear down the client so
-            # the next cycle logs in fresh.
+            if now >= next_keepalive:
+                try:
+                    await mammotion.send_command_with_args(
+                        state["device_name"], "send_todev_ble_sync", sync_type=2
+                    )
+                except Exception:
+                    LOGGER.debug("Keep-alive sync failed", exc_info=True)
+                    # A failing keep-alive usually means a dead cloud session.
+                    # Drop the client; the loop re-logs in on the next tick.
+                    try:
+                        await mammotion.stop()
+                    except Exception:
+                        pass
+                    state["mammotion"] = None
+                next_keepalive = now + keepalive_interval
+
             try:
-                await mammotion.stop()
-            except Exception:
-                LOGGER.exception("Mammotion stop failed")
-            state["mammotion"] = None
-            if not stop_async.is_set():
-                LOGGER.info("Re-logging into Mammotion in %ss", reconnect_backoff)
-                await asyncio.sleep(reconnect_backoff)
+                await asyncio.wait_for(stop_async.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
     finally:
         LOGGER.info("Shutting down")
+        if relay_started:
+            try:
+                await relay.stop()
+            except Exception:
+                LOGGER.exception("Relay stop failed")
+        try:
+            await rtsp_server.stop()
+        except Exception:
+            LOGGER.exception("RTSP server stop failed")
         if state["mammotion"] is not None:
             try:
                 await state["mammotion"].stop()
             except Exception:
                 pass
-        await runner.cleanup()
 
 
 if __name__ == "__main__":
