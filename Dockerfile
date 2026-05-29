@@ -1,4 +1,6 @@
-FROM python:3.14-slim
+FROM python:3.12-slim
+# Pinned to 3.12 because PyAV (av) has no prebuilt wheel for 3.14 yet and we
+# don't want to pull in a full ffmpeg build toolchain just to compile it.
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
