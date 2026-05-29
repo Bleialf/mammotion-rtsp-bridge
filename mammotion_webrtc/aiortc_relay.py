@@ -297,14 +297,25 @@ class AgoraToRtspRelay:
 
         relay_self = self
 
+        tap_stats = {"total": 0, "h265": 0, "other_pt": {}, "first_logged": False}
+
         async def tap(packet: RtpPacket, arrival_time_ms: int) -> None:
             try:
                 effective = _unwrap_rtx_if_needed(packet, codecs_by_pt, rtx_ssrc_map)
-                # Match codec by MIME type, not PT — the negotiated H265 PT
-                # is whatever Agora picked in the answer, not the offer-side
-                # constant in :mod:`h265_patch`.
                 codec = codecs_by_pt.get(effective.payload_type)
-                if codec is not None and codec.mimeType.lower() in h265_patch.H265_MIMETYPES:
+                tap_stats["total"] += 1
+                is_h265 = codec is not None and codec.mimeType.lower() in h265_patch.H265_MIMETYPES
+                if is_h265:
+                    tap_stats["h265"] += 1
+                    if not tap_stats["first_logged"]:
+                        tap_stats["first_logged"] = True
+                        LOGGER.info(
+                            "tap: first H265 packet ssrc=%s pt=%s ts=%s len=%d",
+                            effective.ssrc,
+                            effective.payload_type,
+                            effective.timestamp,
+                            len(effective.payload),
+                        )
                     if relay_self._video_ssrc is None:
                         relay_self._video_ssrc = effective.ssrc
                     if effective.payload:
@@ -313,6 +324,16 @@ class AgoraToRtspRelay:
                             timestamp=effective.timestamp,
                             marker=bool(effective.marker),
                         )
+                else:
+                    pt_counts = tap_stats["other_pt"]
+                    pt_counts[effective.payload_type] = pt_counts.get(effective.payload_type, 0) + 1
+                if tap_stats["total"] % 500 == 0:
+                    LOGGER.info(
+                        "tap stats: total=%d h265=%d non_h265_by_pt=%s",
+                        tap_stats["total"],
+                        tap_stats["h265"],
+                        tap_stats["other_pt"],
+                    )
             except Exception:  # noqa: BLE001
                 LOGGER.exception("RTP tap failed; dropping packet")
             await original_handler(packet, arrival_time_ms=arrival_time_ms)
