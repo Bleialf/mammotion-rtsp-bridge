@@ -74,8 +74,8 @@ docker compose up -d mammotion-bridge
 | `MAMMOTION_RTSP_BIND` | `0.0.0.0` | RTSP bind address |
 | `MAMMOTION_GO2RTC_RECONCILE_SECONDS` | `20` | Periodic go2rtc registration self-heal interval |
 | `MAMMOTION_KEEPALIVE_SECONDS` | `300` | MQTT keepalive cadence to the mower (stay under pymammotion's 300/24h cap) |
-| `MAMMOTION_NO_RTP_WATCHDOG_SECONDS` | `30` | Tear down + reconnect the Agora session if no H265 RTP arrives for this long |
-| `MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS` | `10` | On stall, wait this long after a `refresh_fpv` MQTT nudge before escalating to a full teardown |
+| `MAMMOTION_NO_RTP_WATCHDOG_SECONDS` | `5` | Tear down + reconnect the Agora session if no H265 RTP arrives for this long |
+| `MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS` | `3` | On stall, wait this long after a `refresh_fpv` MQTT nudge before escalating to a full teardown |
 | `MAMMOTION_RECONNECT_BACKOFF_SECONDS` | `8` | Retry delay on cloud/session failure |
 | `MAMMOTION_LOG_LEVEL` | `INFO` | `DEBUG` exposes RTSP method exchange and signaling traces |
 

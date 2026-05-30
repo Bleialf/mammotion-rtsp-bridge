@@ -6,6 +6,28 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-05-30
+
+### Changed
+- **Aggressive recovery defaults out of the box.** The previous defaults
+  (30 s watchdog, 10 s cheap-recovery wait, 5 s reconnect backoff) made
+  stall recovery take ~47 s with no env-var tuning. Re-baselined so a
+  default-config bridge recovers in ~11 s:
+  - `MAMMOTION_NO_RTP_WATCHDOG_SECONDS`: `30` → `5`
+  - `MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS`: `10` → `3`
+  - Relay `reconnect_backoff_seconds`: `5.0` → `1.0` (internal, not env-tunable)
+  - Relay `max_reconnect_backoff_seconds`: `60.0` → `10.0` (internal)
+- Demoted `agora_edge` `Generated answer SDP` log from INFO to DEBUG.
+  Every Agora reconnect was dumping ~50 SDP lines into the log; with the
+  more aggressive recovery defaults that's a lot of noise. Re-enable with
+  `MAMMOTION_LOG_LEVEL=DEBUG`.
+
+### Why
+With v0.1.7's proactive PLI eliminating the GOP wait, the dominant
+remaining freeze contributor was the watchdog / cheap-recovery / backoff
+defaults — all generous holdovers from earlier debugging. The new
+defaults are tuned for "10 fps H265 stream, want sub-15 s gaps."
+
 ## [0.1.7] - 2026-05-30
 
 ### Added
@@ -146,7 +168,8 @@ First public release. Experimental.
 - Example configs for Frigate and standalone go2rtc, plus a documented HA
   advanced-camera-card snippet.
 
-[Unreleased]: https://github.com/Bleialf/mammotion-rtsp-bridge/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/Bleialf/mammotion-rtsp-bridge/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.8
 [0.1.7]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.7
 [0.1.6]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.6
 [0.1.5]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.5

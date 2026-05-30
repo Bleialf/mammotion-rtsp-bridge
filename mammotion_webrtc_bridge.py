@@ -30,10 +30,10 @@ Environment variables:
   MAMMOTION_KEEPALIVE_SECONDS              - MQTT keep-alive interval (default 300)
   MAMMOTION_NO_RTP_WATCHDOG_SECONDS        - tear down upstream + reconnect if no
                                              H265 RTP packet for this many seconds
-                                             (default 30)
+                                             (default 5)
   MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS    - on stall, wait this long after a
                                              refresh_fpv before escalating to a
-                                             full teardown (default 10)
+                                             full teardown (default 3)
   MAMMOTION_RECONNECT_BACKOFF_SECONDS      - login retry backoff (default 8)
 """
 
@@ -301,10 +301,10 @@ async def main() -> None:
         publisher_wakeup=wake_publisher,
         cheap_recovery=_refresh_fpv,
         no_rtp_watchdog_seconds=float(
-            _env_int("MAMMOTION_NO_RTP_WATCHDOG_SECONDS", 30)
+            _env_int("MAMMOTION_NO_RTP_WATCHDOG_SECONDS", 5)
         ),
         cheap_recovery_wait_seconds=float(
-            _env_int("MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS", 10)
+            _env_int("MAMMOTION_CHEAP_RECOVERY_WAIT_SECONDS", 3)
         ),
     )
     # Wire the RTSP server's "new viewer connected" hook back to the relay

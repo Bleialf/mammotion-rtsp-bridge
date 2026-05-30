@@ -1030,7 +1030,10 @@ class AgoraWebSocketHandler:
             self._pending_offer_info = None
             # TEMP diagnostic: full answer SDP so we can verify candidates /
             # setup role / ufrag against go2rtc's ICE attempt.
-            LOGGER.info("Generated answer SDP:\n%s", answer_sdp)
+            # Useful for diagnostics but very chatty — every Agora reconnect
+            # dumps ~50 SDP lines. Demoted to DEBUG; set MAMMOTION_LOG_LEVEL=DEBUG
+            # to re-enable.
+            LOGGER.debug("Generated answer SDP:\n%s", answer_sdp)
             return answer_sdp
         return None
 

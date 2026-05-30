@@ -68,10 +68,10 @@ class AgoraToRtspRelay:
         publisher_wakeup: PublisherWakeup = None,
         cheap_recovery: PublisherWakeup = None,
         upstream_track_timeout_seconds: float = 15.0,
-        reconnect_backoff_seconds: float = 5.0,
-        max_reconnect_backoff_seconds: float = 60.0,
-        no_rtp_watchdog_seconds: float = 30.0,
-        cheap_recovery_wait_seconds: float = 10.0,
+        reconnect_backoff_seconds: float = 1.0,
+        max_reconnect_backoff_seconds: float = 10.0,
+        no_rtp_watchdog_seconds: float = 5.0,
+        cheap_recovery_wait_seconds: float = 3.0,
     ) -> None:
         self._credentials_provider = credentials_provider
         self._agora_context_provider = agora_context_provider
