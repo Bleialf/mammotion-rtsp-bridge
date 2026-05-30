@@ -377,7 +377,8 @@ class AgoraToRtspRelay:
                 effective = _unwrap_rtx_if_needed(packet, codecs_by_pt, rtx_ssrc_map)
                 codec = codecs_by_pt.get(effective.payload_type)
                 if codec is not None and codec.mimeType.lower() in h265_patch.H265_MIMETYPES:
-                    if relay_self._video_ssrc is None:
+                    ssrc_just_learned = relay_self._video_ssrc is None
+                    if ssrc_just_learned:
                         relay_self._video_ssrc = effective.ssrc
                     if effective.payload:
                         relay_self._last_rtp_ns = time.monotonic_ns()
@@ -386,6 +387,19 @@ class AgoraToRtspRelay:
                             timestamp=effective.timestamp,
                             marker=bool(effective.marker),
                         )
+                    if ssrc_just_learned:
+                        # First H265 packet of a new upstream session. The
+                        # mower is mid-GOP and we got handed P-frames — no
+                        # parameter sets in them, so RTSP DESCRIBE would
+                        # block its 10 s wait and go2rtc would time out at
+                        # 5 s. Fire one PLI immediately to force the mower
+                        # to emit a fresh IDR (which prepends VPS/SPS/PPS).
+                        # Detached task so the tap stays non-blocking.
+                        LOGGER.info(
+                            "First H265 RTP received (ssrc=%d); requesting IDR",
+                            effective.ssrc,
+                        )
+                        asyncio.create_task(relay_self.request_keyframe())
             except Exception:  # noqa: BLE001
                 LOGGER.exception("RTP tap failed; dropping packet")
             await original_handler(packet, arrival_time_ms=arrival_time_ms)

@@ -6,6 +6,21 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-05-30
+
+### Added
+- Proactive PLI when the first H265 RTP packet of a new upstream session
+  arrives. The mower is typically mid-GOP at that moment and the first
+  packets we receive are P-frames — which carry no parameter sets, so
+  RTSP `DESCRIBE` blocks waiting for VPS/SPS/PPS and go2rtc times out at
+  5 s. Firing one PLI as soon as we know the publisher's SSRC pushes the
+  mower onto a fresh IDR (which prepends parameter sets), so DESCRIBE
+  completes in ~1 s instead of ~6 s (next natural GOP boundary).
+
+  Cuts black-screen time after every reconnect — token expiry, no-RTP
+  watchdog fire, network blip, etc. Most visible at startup and after
+  any of v0.1.6's cheap-recovery escalations.
+
 ## [0.1.6] - 2026-05-30
 
 ### Added
@@ -131,7 +146,8 @@ First public release. Experimental.
 - Example configs for Frigate and standalone go2rtc, plus a documented HA
   advanced-camera-card snippet.
 
-[Unreleased]: https://github.com/Bleialf/mammotion-rtsp-bridge/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/Bleialf/mammotion-rtsp-bridge/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.7
 [0.1.6]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.6
 [0.1.5]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.5
 [0.1.4]: https://github.com/Bleialf/mammotion-rtsp-bridge/releases/tag/v0.1.4
