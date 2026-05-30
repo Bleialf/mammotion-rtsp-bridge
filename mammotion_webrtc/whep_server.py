@@ -156,12 +156,22 @@ class MammotionWhepManager:
         credentials_provider: StreamCredentialsProvider,
         *,
         publisher_wakeup: Callable[[], Awaitable[None]] | None = None,
+        video_codec: str = "vp8",
     ) -> None:
-        """Store the credentials provider and per-stream session state."""
+        """Store the credentials provider and per-stream session state.
+
+        ``video_codec`` is the codec we tell Agora's edge we want the publisher
+        on (``join_v3``/``subscribe`` ``codec`` field). Defaults to ``vp8`` on
+        this branch — the H265 path through go2rtc/Pion was unworkable, and
+        VP8 is what every WebRTC stack handles natively. If the mower itself
+        doesn't honor the request and keeps publishing H265, the first
+        ``on_add_video_stream`` will reveal it and we'll know to retreat.
+        """
         self._credentials_provider = credentials_provider
         self._publisher_wakeup = publisher_wakeup
         self._lock = asyncio.Lock()
         self._sessions: dict[str, AgoraUpstreamSession] = {}
+        self._video_codec = video_codec
 
     async def create_session(
         self,
@@ -225,7 +235,7 @@ class MammotionWhepManager:
             # times out (p2p_lost). mikey0000's working HA impl never sets
             # audio to inactive.
             on_connection_lost=_on_connection_lost,
-            # video_codec defaults to h265 (Mammotion).
+            video_codec=self._video_codec,
         )
 
         # Collect inline ICE candidates from the offer (PetKit did this in the
@@ -572,6 +582,7 @@ def create_whep_app(
     *,
     auth_token: str | None = None,
     publisher_wakeup: Callable[[], Awaitable[None]] | None = None,
+    video_codec: str = "vp8",
 ) -> web.Application:
     """Build the standalone aiohttp WHEP application.
 
@@ -584,6 +595,7 @@ def create_whep_app(
     manager = MammotionWhepManager(
         credentials_provider,
         publisher_wakeup=publisher_wakeup,
+        video_codec=video_codec,
     )
     app[_MANAGER_KEY] = manager
     app[_TOKEN_KEY] = auth_token

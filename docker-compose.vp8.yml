@@ -1,0 +1,54 @@
+# EXPERIMENTAL — VP8 direct WebRTC passthrough (branch: vp8-direct-passthrough).
+#
+# Asks Agora's edge to forward Mammotion's video as VP8 instead of H265, then
+# brokers WebRTC signaling between go2rtc and Agora so media flows directly
+# (Agora SFU -> go2rtc Pion) with no Python in the data path. The H265 path
+# through Pion was unworkable; VP8 is what every WebRTC stack handles natively.
+#
+# If the mower honors the VP8 request, video should appear in go2rtc as a
+# standard WebRTC source — no aiortc relay, no RTSP server, no monkey-patches.
+# If the mower refuses VP8 and keeps publishing H265, the first
+# `on_add_video_stream` log line will reveal it (look for pt != 97).
+#
+# Runs alongside (not instead of) your :stable bridge — different container
+# name and stream name so you can A/B compare without losing the working setup.
+
+services:
+  mammotion-vp8:
+    container_name: mammotion-vp8
+    # Prebuilt experimental image from this branch.
+    image: ghcr.io/bleialf/mammotion-rtsp-bridge:vp8-test
+    # ...or build locally:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      MAMMOTION_EMAIL: "your@email.com"
+      MAMMOTION_PASSWORD: "your-password"
+      MAMMOTION_DEVICE_NAME: "first"
+      # Codec we ask Agora's edge to deliver. "vp8" is the whole point of
+      # this branch; set "h265" to force the legacy path for comparison.
+      MAMMOTION_VIDEO_CODEC: "vp8"
+      # go2rtc REST API for stream registration (Frigate's bundled go2rtc).
+      GO2RTC_API_URL: "http://frigate:1984"
+      # Distinct stream name so it coexists with your existing setup.
+      MAMMOTION_STREAM_NAME: "mammotion_vp8"
+      # Hostname go2rtc uses to dial our WS signaling endpoint — must match
+      # this container's network name.
+      MAMMOTION_WHEP_HOST: "mammotion-vp8"
+      MAMMOTION_WHEP_PORT: "8555"
+      # go2rtc-native WS signaling (handles continuous trickle ICE; the WHEP
+      # one-shot path is brittle through Pion).
+      MAMMOTION_GO2RTC_SIGNALING: "ws"
+      MAMMOTION_GO2RTC_RECONCILE_SECONDS: "20"
+      MAMMOTION_KEEPALIVE_SECONDS: "10"
+
+    # If this is a SEPARATE compose project from Frigate, attach to Frigate's
+    # network (find it with `docker network ls`) so `frigate` resolves:
+    # networks:
+    #   - frigate_net
+# networks:
+#   frigate_net:
+#     external: true
+#     name: frigate_default

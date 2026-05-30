@@ -2,7 +2,8 @@
 set -eu
 
 mkdir -p /app/.agora
-# BRIDGE_SCRIPT selects which bridge to run:
-#   mammotion_go2rtc_bridge.py  (default) - ffmpeg->RTSP, the stable path
-#   mammotion_webrtc_bridge.py            - experimental WebRTC/WHEP passthrough
-exec python -u "/app/${BRIDGE_SCRIPT:-mammotion_go2rtc_bridge.py}" "$@"
+# This branch (vp8-direct-passthrough) ships the WHEP/WS signaling bridge as
+# the default; it asks Agora for VP8 so the media flows directly into
+# go2rtc/Pion without the H265-passthrough hack. The legacy ffmpeg bridge
+# is still in the image as an opt-in fallback.
+exec python -u "/app/${BRIDGE_SCRIPT:-mammotion_webrtc_bridge.py}" "$@"

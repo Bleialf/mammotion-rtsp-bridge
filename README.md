@@ -1,5 +1,17 @@
 # Mammotion → go2rtc/Frigate Bridge
 
+> 🧪 **You are on the `vp8-direct-passthrough` branch.** This is a single-purpose
+> experiment: ask Agora's edge to deliver Mammotion's video as **VP8** instead
+> of H265, so go2rtc/Pion can be the WebRTC peer directly with no Python in the
+> media path. See [docker-compose.vp8.yml](docker-compose.vp8.yml) and
+> [`MAMMOTION_VIDEO_CODEC`](mammotion_webrtc_bridge.py). Image:
+> `ghcr.io/bleialf/mammotion-rtsp-bridge:vp8-test`.
+>
+> If the mower honors the VP8 request, this whole `mammotion_webrtc` subtree
+> becomes the architecture. If it refuses, the bridge will keep falling back
+> to the `:stable` aiortc relay path on `main`.
+
+
 Streams a Mammotion robot mower's camera (Yuka, Luba 2, etc.) into
 [go2rtc](https://github.com/AlexxIT/go2rtc) / [Frigate](https://frigate.video/)
 so you can view and record it like any other camera.

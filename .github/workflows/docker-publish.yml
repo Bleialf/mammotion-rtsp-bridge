@@ -2,7 +2,7 @@ name: Build and publish Docker image
 
 on:
   push:
-    branches: [main, webrtc-passthrough]
+    branches: [main, webrtc-passthrough, vp8-direct-passthrough]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -47,6 +47,8 @@ jobs:
             type=sha,prefix=sha-
             # webrtc-passthrough branch -> :webrtc-test (experimental image)
             type=raw,value=webrtc-test,enable=${{ github.ref == 'refs/heads/webrtc-passthrough' }}
+            # vp8-direct-passthrough branch -> :vp8-test (experimental image)
+            type=raw,value=vp8-test,enable=${{ github.ref == 'refs/heads/vp8-direct-passthrough' }}
             # Releases: tag v1.2.3 -> :1.2.3, :1.2, :1, and :stable
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

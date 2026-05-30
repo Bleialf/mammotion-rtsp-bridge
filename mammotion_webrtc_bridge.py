@@ -31,6 +31,9 @@ Environment variables:
     MAMMOTION_GO2RTC_RECONCILE_SECONDS     - periodic re-register interval
                                                                                      (default 20)
   MAMMOTION_KEEPALIVE_SECONDS            - MQTT keep-alive interval (default 10)
+  MAMMOTION_VIDEO_CODEC                  - codec we ask Agora to deliver
+                                           (default "vp8"; set "h265" to force
+                                           the legacy H265 path)
   MAMMOTION_RECONNECT_BACKOFF_SECONDS    - login retry backoff (default 8)
 """
 
@@ -152,6 +155,11 @@ async def main() -> None:
     go2rtc_reconcile_interval = float(_env_int("MAMMOTION_GO2RTC_RECONCILE_SECONDS", 20))
     keepalive_interval = float(_env_int("MAMMOTION_KEEPALIVE_SECONDS", 10))
     reconnect_backoff = _env_int("MAMMOTION_RECONNECT_BACKOFF_SECONDS", 8)
+    # Codec we ask Agora's edge to forward (subscribe / join_v3 "codec" field).
+    # Default vp8 on this branch — Pion (go2rtc) handles VP8 natively, where
+    # H265 needs the aiortc relay hack. Set MAMMOTION_VIDEO_CODEC=h265 to force
+    # the old behavior for comparison testing.
+    video_codec = (os.getenv("MAMMOTION_VIDEO_CODEC", "vp8") or "vp8").strip().lower()
 
     LOGGER.info("Loading Mammotion SDK modules")
     from pymammotion.client import MammotionClient
@@ -270,6 +278,12 @@ async def main() -> None:
         credentials_provider,
         auth_token=whep_token,
         publisher_wakeup=wake_publisher,
+        video_codec=video_codec,
+    )
+    LOGGER.info(
+        "WebRTC passthrough configured: codec=%s signaling=%s",
+        video_codec,
+        go2rtc_signaling,
     )
     runner = web.AppRunner(app)
     await runner.setup()

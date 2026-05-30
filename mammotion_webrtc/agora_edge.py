@@ -44,10 +44,12 @@ from .sdp import SDPParser, parse_offer_to_ortc
 
 LOGGER = logging.getLogger(__name__)
 
-# Mammotion publishes H.265. The PetKit reference hardcoded "h264" in three
-# subscribe calls (agora_websocket.py ~553, ~642, ~679 / join_v3 codec).
-# Changed here; the SDP builders themselves stay codec-agnostic.
-DEFAULT_VIDEO_CODEC = "h265"
+# Codec we ask Agora's edge to deliver (subscribe / join_v3 ``codec`` field).
+# Mammotion's app defaults to H265, but the SFU also advertises VP8 and the
+# mower honors VP8 when asked — and VP8 is the only path that survives Pion
+# (go2rtc's WebRTC stack) intact. The SDP builders themselves stay
+# codec-agnostic; they pick whatever PT the publisher actually emits.
+DEFAULT_VIDEO_CODEC = "vp8"
 
 
 # ---------------------------------------------------------------------------
