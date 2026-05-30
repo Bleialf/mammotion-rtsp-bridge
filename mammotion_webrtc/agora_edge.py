@@ -781,18 +781,17 @@ class AgoraWebSocketHandler:
                             return answer
 
         except TimeoutError:
-            if (
-                self._pending_answer_ortc is not None
-                and self._pending_offer_info is not None
-            ):
-                LOGGER.warning(
-                    "Timeout waiting for announced video stream; "
-                    "falling back to early SDP answer"
-                )
-                answer = self._finalize_pending_answer()
-                if answer:
-                    return answer
-            LOGGER.error("Timeout waiting for join_v3 response")
+            # Previously this had an "early SDP answer" fallback that returned
+            # an SDP without the publisher's actual SSRC/PT. In practice that
+            # makes the downstream RTP tap silently drop every packet (codec
+            # lookup misses), and the bridge winds up in a rapid no-RTP ->
+            # watchdog -> reconnect loop that hits the same timeout again.
+            # Raising instead lets the relay supervisor back off and retry
+            # cleanly with fresh credentials; gives the mower time to publish.
+            LOGGER.error(
+                "Timeout waiting for Agora on_add_video_stream — "
+                "publisher likely not yet active; will retry"
+            )
         except WebSocketException as err:
             LOGGER.error("WebSocket error while waiting for join response: %s", err)
             self._connection_state = "DISCONNECTED"
